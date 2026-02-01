@@ -1,0 +1,56 @@
+# ClawGuard configuration
+# Copy to ~/.openclaw/clawguard/config.toml
+
+# Default guardrail — gates all actions
+[models.default]
+path = "~/.openclaw/clawguard/action-classifier.onnx"
+actions = ["*"]
+
+# Financial actions get a specialized model
+[models.financial]
+path = "~/.openclaw/clawguard/financial-guardian.onnx"
+actions = ["send_payment", "transfer_funds", "approve_transaction"]
+
+# PII detection model
+[models.pii]
+path = "~/.openclaw/clawguard/pii-detector.onnx"
+actions = ["send_email", "send_message", "post_comment", "upload_file"]
+
+# Custom ONNX model with metadata
+# [models.my-custom-model]
+# path = "~/.openclaw/clawguard/models/custom.onnx"
+# meta = "~/.openclaw/clawguard/models/custom.meta.toml"
+# actions = ["run_command", "network_request"]
+
+[settings]
+# Always generate ZK proofs (set to false for faster dry-run mode)
+require_proof = true
+
+# Where proof files are stored
+proof_dir = "~/.openclaw/clawguard/proofs"
+
+# If the guardrail model errors, deny the action (fail-closed)
+deny_on_error = true
+
+# Enforcement level: "log", "soft", or "hard"
+# - log: always allow, but log denials
+# - soft: deny with overridable=true, exit code 0 with warning
+# - hard: deny with overridable=false, exit code 1
+enforcement = "hard"
+
+# Max trace length for ZK proving (auto-detected if omitted)
+# max_trace_length = 16384
+
+# User-defined policy rules — compiled into model weights for ZK proving
+# Each rule becomes a hidden neuron in a policy model.
+
+[[rules]]
+name = "block-banking-sites"
+block_domains = ["chase.com", "bankofamerica.com", "wellsfargo.com"]
+actions = ["network_request"]
+
+[[rules]]
+name = "protect-secrets"
+block_paths = ["~/.ssh", "~/.gnupg", "~/.aws", "*.env"]
+block_keywords = ["password", "secret", "api_key"]
+actions = ["read_file", "write_file", "run_command"]
