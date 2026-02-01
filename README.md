@@ -2,7 +2,7 @@
 
 **Cryptographically verified guardrails for [OpenClaw](https://openclaw.ai/) agents powered by [Jolt Atlas zkML](https://github.com/ICME-Lab/jolt-atlas).**
 
-ClawGuard sits between your [OpenClaw](https://openclaw.ai/) agent and the dangerous things it can do. Before the agent runs a shell command, sends an email, or touches a sensitive file, ClawGuard checks whether that action looks safe. If it doesn't, the action gets blocked. And unlike a simple allowlist, every decision comes with a cryptographic proof that the safety check actually happened — nobody can skip it and nobody can fake the result.
+ClawGuard sits between your OpenClaw agent and the dangerous things it can do. Before the agent runs a shell command, sends an email, or touches a sensitive file, ClawGuard checks whether that action looks safe. If it doesn't, the action gets blocked. And unlike a simple allowlist, every decision comes with a cryptographic proof that the safety check actually happened — nobody can skip it and nobody can fake the result.
 
 ## How It Works (Plain English)
 
