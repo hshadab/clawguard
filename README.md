@@ -75,17 +75,31 @@ If you've trained a custom ONNX classifier (for example, a model that detects fi
 ### What you need
 
 - **Rust 1.80+** — install from [rustup.rs](https://rustup.rs/) if you don't have it
-- **Git** — to clone the repo
+- **Git** — to clone the repos
 
 That's it. No Python, no Docker, no model downloads.
 
 ### 1. Clone and build
 
+ClawGuard is a standalone project that uses [Jolt Atlas](https://github.com/ICME-Lab/jolt-atlas) as a dependency for its ZK proof engine. It does **not** live inside the Jolt Atlas repository — it's a separate repo that must be built alongside a local Jolt Atlas checkout because it depends on workspace-level crate resolution.
+
 ```bash
+# Clone jolt-atlas (the ZK proof engine ClawGuard depends on)
 git clone https://github.com/ICME-Lab/jolt-atlas.git
-cd jolt-atlas/clawguard
-cargo build --release
+
+# Clone clawguard alongside it
+git clone https://github.com/hshadab/clawguard.git
+
+# Add clawguard to the jolt-atlas workspace so Cargo can resolve dependencies
+cd jolt-atlas
+# Add "clawguard" to the workspace members list in Cargo.toml, and create a symlink:
+ln -s ../clawguard clawguard
+
+# Build from the workspace root
+cargo build -p clawguard --release
 ```
+
+> **Why this setup?** ClawGuard depends on `onnx-tracer` and `zkml-jolt-core` (crates inside jolt-atlas) via path dependencies, and shares `ark-serialize` via workspace inheritance. This is a build-time requirement only — ClawGuard does not modify, fork, or contribute to the Jolt Atlas repository.
 
 The first build compiles the ZK proof libraries from source. Subsequent builds are fast.
 
@@ -412,6 +426,9 @@ clawguard history [--limit N]
 
 # List available models
 clawguard models
+
+# Validate your config file
+clawguard config-check
 ```
 
 **Model names** for the `--model` flag:
@@ -492,13 +509,13 @@ The easiest way is to symlink or copy into your workspace skills directory:
 
 ```bash
 # Workspace skills have the highest loading priority
-ln -s /path/to/jolt-atlas/clawguard ~/.openclaw/workspace/skills/clawguard
+ln -s /path/to/clawguard ~/.openclaw/workspace/skills/clawguard
 ```
 
 Alternatively, install to the managed skills directory:
 
 ```bash
-ln -s /path/to/jolt-atlas/clawguard ~/.openclaw/skills/clawguard
+ln -s /path/to/clawguard ~/.openclaw/skills/clawguard
 ```
 
 Make sure the `clawguard` binary is on your PATH (or in a location the agent can find). The skill's `metadata.openclaw.requires.bins` field gates loading on the binary being available.
@@ -571,6 +588,7 @@ Built-in Models  Your Rules      ONNX Models      jolt-atlas
 src/
     lib.rs             -- Library entry point: GuardModel, config, run_guardrail()
     main.rs            -- CLI (thin wrapper over the library)
+    action.rs          -- ActionType enum (type-safe action names)
     enforcement.rs     -- Enforcement levels, Decision type, Guardrail struct, ActionGuard trait
     rules.rs           -- Policy rule parsing and compilation to neural network weights
     onnx_support.rs    -- ONNX model loading and metadata
