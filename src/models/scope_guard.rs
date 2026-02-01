@@ -6,6 +6,50 @@ use onnx_tracer::graph::model::Model;
 use onnx_tracer::ops::poly::PolyOp;
 use onnx_tracer::tensor::Tensor;
 
+// ---------------------------------------------------------------------------
+// Weight constants — documented rationale
+// ---------------------------------------------------------------------------
+
+// Fixed-point scale=7 (2^7 = 128). See action_gatekeeper.rs for full explanation.
+
+/// Layer 1 weights: [4 hidden neurons, 8 input features]
+///
+/// Neuron 0 (safe path): 90 on in_workspace[0], inhibited by danger signals.
+///   -40 on has_dotdot[1], -30 on system_dir[3], -40 on home_escape[4].
+///   30 bias: paths that are clearly in-workspace start with a positive signal.
+///
+/// Neuron 1 (traversal danger): 90 on has_dotdot[1], 30 on path_depth[2].
+///   Path traversal (../) is the most common escape technique.
+///   20 on is_absolute[6]: absolute paths combined with traversal are extra risky.
+///
+/// Neuron 2 (system target): 90 on targets_system_dir[3], 70 on is_absolute[6].
+///   Accessing /etc, /sys, /proc etc. is almost always out of scope.
+///
+/// Neuron 3 (home escape): 90 on home_outside_workspace[4], 80 on sensitive_dotfile[5].
+///   Accessing ~/.ssh, ~/.aws etc. outside workspace is a credential theft vector.
+const W1: &[i32] = &[
+    90, -40, -20, -30, -40, -30, -20, 0,  // safe path
+    -30, 90, 30, 0, 0, 0, 20, 0,          // traversal danger
+    -20, 0, 0, 90, 0, 0, 70, 0,           // system target
+    -20, 0, 0, 0, 90, 80, 0, 0,           // home escape
+];
+
+const B1: &[i32] = &[30, 0, 0, 0]; // safe path starts with positive bias
+
+/// Layer 2 weights: [2 output neurons, 4 hidden neurons]
+///
+/// Output 0 (OUT_OF_SCOPE): -40 from safe + 70 from traversal + 60 from system + 60 from home.
+///   All danger neurons contribute to out-of-scope classification.
+///
+/// Output 1 (IN_SCOPE): 80 from safe, inhibited by all danger neurons.
+///   10 bias: slight default toward in-scope for paths that don't trigger any danger.
+const W2: &[i32] = &[
+    -40, 70, 60, 60,   // out_of_scope
+    80, -50, -40, -40,  // in_scope
+];
+
+const B2: &[i32] = &[0, 10]; // slight bias toward in_scope
+
 /// Build the scope-guard model.
 ///
 /// Input [1,8]: path_in_workspace, has_dotdot, path_depth, targets_system_dir,
@@ -20,27 +64,14 @@ pub fn scope_guard_model() -> Model {
     let input = b.input(vec![1, 8], 1);
 
     // Layer 1: [1,8] x [4,8] -> [1,4]
-    // Neuron 0 (safe path): in_workspace, low depth
-    // Neuron 1 (traversal danger): has_dotdot, deep path
-    // Neuron 2 (system target): targets_system_dir, is_absolute
-    // Neuron 3 (home escape): targets_home_outside, sensitive_dotfile
-    let mut w1 = Tensor::new(
-        Some(&[
-            90, -40, -20, -30, -40, -30, -20, 0,  // safe path
-            -30, 90, 30, 0, 0, 0, 20, 0,          // traversal danger
-            -20, 0, 0, 90, 0, 0, 70, 0,           // system target
-            -20, 0, 0, 0, 90, 80, 0, 0,           // home escape
-        ]),
-        &[4, 8],
-    )
-    .unwrap();
+    let mut w1 = Tensor::new(Some(W1), &[4, 8]).unwrap();
     w1.set_scale(SCALE);
     let w1_const = b.const_tensor(w1, vec![4, 8], 1);
 
     let mm1 = b.matmult(input, w1_const, vec![1, 4], 1);
     let mm1_rescaled = b.div(128, mm1, vec![1, 4], 1);
 
-    let mut b1 = Tensor::new(Some(&[30, 0, 0, 0]), &[1, 4]).unwrap();
+    let mut b1 = Tensor::new(Some(B1), &[1, 4]).unwrap();
     b1.set_scale(SCALE);
     let b1_const = b.const_tensor(b1, vec![1, 4], 1);
     let biased1 = b.poly(PolyOp::Add, mm1_rescaled, b1_const, vec![1, 4], 1);
@@ -48,22 +79,14 @@ pub fn scope_guard_model() -> Model {
     let relu1 = b.relu(biased1, vec![1, 4], 1);
 
     // Layer 2: [1,4] x [2,4] -> [1,2]
-    // Swapped rows: output[0] = out_of_scope (deny), output[1] = in_scope (allow)
-    let mut w2 = Tensor::new(
-        Some(&[
-            -40, 70, 60, 60,   // out_of_scope
-            80, -50, -40, -40,  // in_scope
-        ]),
-        &[2, 4],
-    )
-    .unwrap();
+    let mut w2 = Tensor::new(Some(W2), &[2, 4]).unwrap();
     w2.set_scale(SCALE);
     let w2_const = b.const_tensor(w2, vec![2, 4], 1);
 
     let mm2 = b.matmult(relu1, w2_const, vec![1, 2], 1);
     let mm2_rescaled = b.div(128, mm2, vec![1, 2], 1);
 
-    let mut b2 = Tensor::new(Some(&[0, 10]), &[1, 2]).unwrap();
+    let mut b2 = Tensor::new(Some(B2), &[1, 2]).unwrap();
     b2.set_scale(SCALE);
     let b2_const = b.const_tensor(b2, vec![1, 2], 1);
     let output = b.poly(PolyOp::Add, mm2_rescaled, b2_const, vec![1, 2], 1);
@@ -87,7 +110,6 @@ mod tests {
         let result = model.forward(&[input]).unwrap();
         let out = result.outputs[0].clone();
         let data = out.inner;
-        // output[0] = out_of_scope, output[1] = in_scope
         assert!(data[0] > data[1], "Expected OUT_OF_SCOPE, got out={} in={}", data[0], data[1]);
     }
 
@@ -103,7 +125,6 @@ mod tests {
         let result = model.forward(&[input]).unwrap();
         let out = result.outputs[0].clone();
         let data = out.inner;
-        // output[0] = out_of_scope, output[1] = in_scope
         assert!(data[1] > data[0], "Expected IN_SCOPE, got out={} in={}", data[0], data[1]);
     }
 }

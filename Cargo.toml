@@ -29,6 +29,6 @@ base64 = "0.22"
 # jolt-atlas dependencies for proof generation
 zkml-jolt-core = { path = "../zkml-jolt-core" }
 onnx-tracer = { path = "../onnx-tracer" }
-ark-bn254 = "0.5.0"
+ark-bn254 = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
 ark-serialize = { workspace = true }
 jolt-core = { git = "https://github.com/ICME-Lab/zkml-jolt", branch = "dev", package = "jolt-core", default-features = true }

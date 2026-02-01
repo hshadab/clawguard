@@ -8,7 +8,8 @@ use std::path::PathBuf;
 
 use clawguard::{
     enforcement::EnforcementLevel,
-    history_path, is_deny_decision, load_config, run_guardrail, GuardModel,
+    history_path, is_deny_decision, load_config, rotate_history_if_needed, run_guardrail,
+    validate_config, GuardModel,
 };
 
 #[derive(Parser)]
@@ -52,7 +53,7 @@ enum Commands {
         #[arg(long)]
         proof: PathBuf,
 
-        /// Expected model hash (sha256)
+        /// Expected model hash (sha256) — verification fails if this doesn't match
         #[arg(long)]
         model_hash: String,
 
@@ -70,6 +71,9 @@ enum Commands {
 
     /// Show loaded guardrail models from config
     Models,
+
+    /// Validate the config file and report any issues
+    ConfigCheck,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -102,6 +106,9 @@ fn cmd_check(
 ) -> Result<i32> {
     let config = load_config();
     let generate_proof = prove && !dry_run;
+
+    // Rotate history if needed before appending
+    rotate_history_if_needed(config.as_ref());
 
     // Determine enforcement level from config
     let enforcement = config
@@ -139,7 +146,7 @@ fn cmd_check(
 
     println!("{}", serde_json::to_string_pretty(&result)?);
 
-    // Append to history log (Issue 13: use history_path, not proof_dir)
+    // Append to history log
     let hist = history_path(config.as_ref());
     if let Some(parent) = hist.parent() {
         fs::create_dir_all(parent)?;
@@ -172,22 +179,20 @@ fn cmd_check(
 }
 
 fn cmd_verify(proof: PathBuf, model_hash: String, model_name: String) -> Result<()> {
-    let content = fs::read_to_string(&proof).wrap_err("failed to read proof file")?;
-    let proof_data: serde_json::Value = serde_json::from_str(&content)?;
-    let stored_hash = proof_data
-        .get("model_hash")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let hash_matches = stored_hash == model_hash;
-
     let guard = GuardModel::from_name(&model_name)?;
     let trace_len = guard.max_trace_length();
-    let valid =
-        clawguard::proving::verify_proof_file(&proof, guard.model_fn(), trace_len)?;
+
+    // Fail-closed: pass expected hash so verification rejects mismatches
+    let valid = clawguard::proving::verify_proof_file(
+        &proof,
+        guard.model_fn(),
+        trace_len,
+        Some(&model_hash),
+    )?;
 
     let result = VerifyResult {
         valid,
-        model_hash_matches: hash_matches,
+        model_hash_matches: true, // If we got here, hash matched (otherwise bail above)
         proof_file: proof.to_string_lossy().to_string(),
     };
 
@@ -250,6 +255,42 @@ fn cmd_models() -> Result<()> {
     Ok(())
 }
 
+fn cmd_config_check() -> Result<()> {
+    let config_path = clawguard::config_dir().join("config.toml");
+    println!("Config path: {}", config_path.display());
+
+    if !config_path.exists() {
+        println!("No config file found. Using defaults.");
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&config_path)
+        .wrap_err("failed to read config file")?;
+
+    let config: clawguard::GuardsConfig = match toml::from_str(&content) {
+        Ok(c) => {
+            println!("Config file parsed successfully.");
+            c
+        }
+        Err(e) => {
+            eprintln!("ERROR: failed to parse config: {}", e);
+            return Ok(());
+        }
+    };
+
+    let issues = validate_config(&config);
+    if issues.is_empty() {
+        println!("All checks passed.");
+    } else {
+        for issue in &issues {
+            println!("  {}", issue);
+        }
+        println!("\n{} issue(s) found.", issues.len());
+    }
+
+    Ok(())
+}
+
 fn main() {
     // Initialize policy rules from config if present
     if let Some(config) = load_config() {
@@ -291,6 +332,7 @@ fn main() {
         } => cmd_verify(proof, model_hash, model_name),
         Commands::History { limit } => cmd_history(limit),
         Commands::Models => cmd_models(),
+        Commands::ConfigCheck => cmd_config_check(),
     };
 
     if let Err(e) = result {

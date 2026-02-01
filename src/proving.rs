@@ -3,12 +3,13 @@
 use ark_bn254::Fr;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use eyre::{Result, WrapErr};
+use eyre::{bail, Result, WrapErr};
 use jolt_core::poly::commitment::dory::DoryCommitmentScheme;
 use jolt_core::transcripts::KeccakTranscript;
 use onnx_tracer::graph::model::Model;
 use onnx_tracer::tensor::Tensor;
 use onnx_tracer::ProgramIO;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -17,8 +18,18 @@ use zkml_jolt_core::jolt::JoltSNARK;
 type PCS = DoryCommitmentScheme;
 type Snark = JoltSNARK<Fr, PCS, KeccakTranscript>;
 
-/// Global mutex to prevent concurrent proving (OnceLock globals are single-model).
-static PROVE_MUTEX: Mutex<()> = Mutex::new(());
+/// Per-model mutexes to allow concurrent proving across different models
+/// while still serializing proofs for the same model (OnceLock state limitation).
+static MODEL_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn get_model_lock(model_name: &str) -> std::sync::Arc<Mutex<()>> {
+    let mut locks = MODEL_LOCKS.lock().unwrap();
+    locks
+        .entry(model_name.to_string())
+        .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+        .clone()
+}
 
 /// Generate a proof and save it to a JSON file.
 ///
@@ -29,8 +40,10 @@ pub fn prove_and_save(
     proof_dir: &Path,
     model_hash: &str,
     max_trace_length: usize,
+    model_name: &str,
 ) -> Result<(PathBuf, ProgramIO)> {
-    let _lock = PROVE_MUTEX.lock().unwrap();
+    let lock = get_model_lock(model_name);
+    let _guard = lock.lock().unwrap();
 
     let preprocessing = Snark::prover_preprocess(model_fn, max_trace_length);
 
@@ -75,13 +88,34 @@ pub fn prove_and_save(
 }
 
 /// Verify a proof from a saved JSON file.
+///
+/// Fails if `expected_model_hash` does not match the hash stored in the proof file
+/// (fail-closed verification).
 pub fn verify_proof_file(
     proof_path: &Path,
     model_fn: fn() -> Model,
     max_trace_length: usize,
+    expected_model_hash: Option<&str>,
 ) -> Result<bool> {
     let content = fs::read_to_string(proof_path).wrap_err("failed to read proof file")?;
     let data: serde_json::Value = serde_json::from_str(&content)?;
+
+    // Fail-closed: if an expected hash is provided, it must match the proof's stored hash
+    let stored_hash = data
+        .get("model_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if let Some(expected) = expected_model_hash {
+        if stored_hash != expected {
+            bail!(
+                "model hash mismatch: proof contains '{}' but expected '{}'. \
+                 The model may have been swapped since this proof was generated.",
+                stored_hash,
+                expected
+            );
+        }
+    }
 
     let proof_b64 = data
         .get("proof")

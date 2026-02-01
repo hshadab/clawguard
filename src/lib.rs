@@ -1,6 +1,7 @@
 //! ClawGuard library — enforcement, models, encoding, proving, and policy rules
 //! for gating agent actions with zero-knowledge proofs.
 
+pub mod action;
 pub mod encoding;
 pub mod enforcement;
 pub mod models;
@@ -43,6 +44,8 @@ pub struct SettingsConfig {
     pub deny_on_error: Option<bool>,
     pub enforcement: Option<String>,
     pub max_trace_length: Option<usize>,
+    /// Maximum history file size in bytes before rotation (default: 10MB).
+    pub max_history_bytes: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -86,8 +89,128 @@ pub fn load_config() -> Option<GuardsConfig> {
     toml::from_str(&content).ok()
 }
 
+/// Validate a config, returning a list of warnings and errors.
+pub fn validate_config(config: &GuardsConfig) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    // Validate enforcement level
+    if let Some(settings) = &config.settings {
+        if let Some(ref enforcement) = settings.enforcement {
+            if enforcement.parse::<enforcement::EnforcementLevel>().is_err() {
+                issues.push(format!(
+                    "ERROR: unknown enforcement level '{}', expected log/soft/hard",
+                    enforcement
+                ));
+            }
+        }
+        // Validate proof_dir exists or is creatable
+        if let Some(ref pd) = settings.proof_dir {
+            let expanded = pd.replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy());
+            let p = PathBuf::from(&expanded);
+            if p.exists() && !p.is_dir() {
+                issues.push(format!("ERROR: proof_dir '{}' exists but is not a directory", pd));
+            }
+        }
+        // Validate history_dir
+        if let Some(ref hd) = settings.history_dir {
+            let expanded = hd.replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy());
+            let p = PathBuf::from(&expanded);
+            if p.exists() && !p.is_dir() {
+                issues.push(format!("ERROR: history_dir '{}' exists but is not a directory", hd));
+            }
+        }
+    }
+
+    // Validate model paths
+    if let Some(ref models) = config.models {
+        for (name, model) in models {
+            if let Some(ref path) = model.path {
+                let expanded = path.replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy());
+                if !PathBuf::from(&expanded).exists() {
+                    issues.push(format!("WARNING: model '{}' path '{}' does not exist", name, path));
+                }
+            }
+            // Validate action types
+            for action_str in &model.actions {
+                if action_str != "*" && action::ActionType::from_str_opt(action_str).is_none() {
+                    issues.push(format!(
+                        "WARNING: model '{}' has unknown action type '{}'",
+                        name, action_str
+                    ));
+                }
+            }
+        }
+    }
+
+    // Validate rules
+    if let Some(ref rule_configs) = config.rules {
+        for rc in rule_configs {
+            if let Some(ref actions) = rc.actions {
+                for a in actions {
+                    if a != "*" && action::ActionType::from_str_opt(a).is_none() {
+                        issues.push(format!(
+                            "WARNING: rule '{}' has unknown action type '{}'",
+                            rc.name, a
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    issues
+}
+
 // ---------------------------------------------------------------------------
-// Deny-decision check (Issue 2: centralized, not scattered magic literals)
+// History rotation
+// ---------------------------------------------------------------------------
+
+const DEFAULT_MAX_HISTORY_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
+
+/// Rotate history file if it exceeds the configured max size.
+/// Keeps the most recent half of entries.
+pub fn rotate_history_if_needed(config: Option<&GuardsConfig>) {
+    let hist = history_path(config);
+    if !hist.exists() {
+        return;
+    }
+
+    let max_bytes = config
+        .and_then(|c| c.settings.as_ref())
+        .and_then(|s| s.max_history_bytes)
+        .unwrap_or(DEFAULT_MAX_HISTORY_BYTES);
+
+    let metadata = match fs::metadata(&hist) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+
+    if metadata.len() <= max_bytes {
+        return;
+    }
+
+    // Read all lines, keep the most recent half
+    let content = match fs::read_to_string(&hist) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+    let keep_from = lines.len() / 2;
+    let kept: String = lines[keep_from..]
+        .iter()
+        .map(|l| format!("{}\n", l))
+        .collect();
+
+    let _ = fs::write(&hist, kept);
+    eprintln!(
+        "INFO: rotated history file (dropped {} old entries, kept {})",
+        keep_from,
+        lines.len() - keep_from
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Deny-decision check (centralized, not scattered magic literals)
 // ---------------------------------------------------------------------------
 
 pub fn is_deny_decision(label: &str) -> bool {
@@ -95,15 +218,21 @@ pub fn is_deny_decision(label: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Model hash
+// Model hash — versioned to prevent breakage across serde changes
 // ---------------------------------------------------------------------------
+
+/// Version prefix for built-in model hashes. Bump when serialization format changes.
+const MODEL_HASH_VERSION: &str = "v1";
 
 pub fn hash_model_fn(model_fn: fn() -> Model) -> String {
     let model = model_fn();
     let bytecode = onnx_tracer::decode_model(model);
-    // Use serde_json for deterministic serialization instead of Debug formatting
     let serialized = serde_json::to_vec(&bytecode).unwrap_or_else(|_| format!("{:?}", bytecode).into_bytes());
-    let hash = Sha256::digest(&serialized);
+    // Include version prefix so hash changes if serialization format evolves
+    let mut hasher = Sha256::new();
+    hasher.update(MODEL_HASH_VERSION.as_bytes());
+    hasher.update(&serialized);
+    let hash = hasher.finalize();
     format!("sha256:{}", hex::encode(hash))
 }
 
@@ -142,7 +271,6 @@ impl GuardModel {
             let meta = if meta_path.is_file() {
                 onnx_support::OnnxModelMeta::load(&meta_path)?
             } else {
-                // Try .onnx -> .meta.toml (strip .onnx, add .meta.toml)
                 let alt = path.with_file_name(
                     format!(
                         "{}.meta.toml",
@@ -274,7 +402,7 @@ impl GuardModel {
         }
     }
 
-    /// Returns the action types this model is relevant for (Issue 9).
+    /// Returns the action types this model is relevant for.
     pub fn applicable_actions(&self) -> &[&str] {
         match self {
             Self::ActionGatekeeper => &["run_command", "send_email", "write_file", "network_request"],
@@ -282,6 +410,17 @@ impl GuardModel {
             Self::ScopeGuard => &["read_file", "write_file"],
             Self::PolicyRules => &["run_command", "send_email", "read_file", "write_file", "network_request"],
             Self::Onnx { .. } => &["run_command", "send_email", "read_file", "write_file", "network_request"],
+        }
+    }
+
+    /// A short name for use in per-model locking and logging.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::ActionGatekeeper => "action-gatekeeper",
+            Self::PiiShield => "pii-shield",
+            Self::ScopeGuard => "scope-guard",
+            Self::PolicyRules => "policy-rules",
+            Self::Onnx { .. } => "custom-onnx",
         }
     }
 }
@@ -328,8 +467,9 @@ pub fn run_guardrail(
     let proof_path = if generate_proof {
         let dir = proof_dir(config);
         let trace_len = guard.max_trace_length();
+        let model_name = guard.name().to_string();
         let (path, _program_io) =
-            proving::prove_and_save(model_fn, &input, &dir, &model_hash, trace_len)?;
+            proving::prove_and_save(model_fn, &input, &dir, &model_hash, trace_len, &model_name)?;
         Some(path)
     } else {
         None

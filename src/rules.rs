@@ -120,7 +120,17 @@ pub fn compile_rules(rules: &[PolicyRule]) -> CompiledPolicy {
     }
 
     // Input width = 5 (action one-hot) + num_conditions, capped at MAX_INPUT_WIDTH
-    let num_conditions = conditions.len().min(MAX_INPUT_WIDTH - 5);
+    let total_conditions = conditions.len();
+    let num_conditions = total_conditions.min(MAX_INPUT_WIDTH - 5);
+    if total_conditions > num_conditions {
+        eprintln!(
+            "WARNING: policy rules have {} conditions but max is {}. \
+             {} conditions will be ignored. Consider consolidating rules.",
+            total_conditions,
+            MAX_INPUT_WIDTH - 5,
+            total_conditions - num_conditions
+        );
+    }
     let input_width = 5 + num_conditions;
     let num_rules = rules.len();
 

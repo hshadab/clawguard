@@ -4,12 +4,13 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
+use crate::action::ActionType;
 use crate::rules::CompiledPolicy;
 
 const SCALE_MULTIPLIER: i32 = 128; // 2^7, matching scale=7
 
 // ---------------------------------------------------------------------------
-// Pre-compiled regexes (Issue 6: avoid recompiling on every call)
+// Pre-compiled regexes (avoid recompiling on every call)
 // ---------------------------------------------------------------------------
 
 static SSN_RE: LazyLock<Regex> =
@@ -18,10 +19,10 @@ static SSN_RE: LazyLock<Regex> =
 static EMAIL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap());
 
-// Note (Issue 8): The phone regex (\b\d{3}[-.]?\d{3}[-.]?\d{4}\b) can in
-// theory match a bare 10-digit substring of an SSN-like string. In practice
-// SSNs contain hyphens after groups of 3-2-4 digits which prevents the phone
-// pattern from matching, so the overlap is benign for realistic inputs.
+// Note: The phone regex (\b\d{3}[-.]?\d{3}[-.]?\d{4}\b) can in theory match a
+// bare 10-digit substring of an SSN-like string. In practice SSNs contain
+// hyphens after groups of 3-2-4 digits which prevents the phone pattern from
+// matching, so the overlap is benign for realistic inputs.
 static PHONE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b").unwrap());
 
@@ -36,7 +37,13 @@ static CC_RE: LazyLock<Regex> =
 /// 6: targets_dotfile
 /// 7: has_pipe_redirect
 pub fn encode_action(action: &str, context: &str) -> Vec<i32> {
-    let ctx: serde_json::Value = serde_json::from_str(context).unwrap_or_default();
+    let ctx: serde_json::Value = match serde_json::from_str(context) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("DEBUG: encode_action: failed to parse context JSON: {}", e);
+            serde_json::Value::default()
+        }
+    };
     let command = ctx
         .get("command")
         .and_then(|v| v.as_str())
@@ -46,14 +53,11 @@ pub fn encode_action(action: &str, context: &str) -> Vec<i32> {
 
     let mut features = vec![0i32; 8];
 
-    // One-hot action type
-    match action {
-        "run_command" => features[0] = SCALE_MULTIPLIER,
-        "send_email" => features[1] = SCALE_MULTIPLIER,
-        "read_file" => features[2] = SCALE_MULTIPLIER,
-        "write_file" => features[3] = SCALE_MULTIPLIER,
-        "network_request" => features[4] = SCALE_MULTIPLIER,
-        _ => {}
+    // One-hot action type via ActionType enum
+    if let Some(at) = ActionType::from_str_opt(action) {
+        features[at.one_hot_index()] = SCALE_MULTIPLIER;
+    } else {
+        eprintln!("DEBUG: encode_action: unknown action type '{}'", action);
     }
 
     // Binary features from context
@@ -129,7 +133,13 @@ pub fn encode_pii(text: &str) -> Vec<i32> {
 /// 6: is_absolute
 /// 7: path_length_bucket
 pub fn encode_scope(_action: &str, context: &str) -> Vec<i32> {
-    let ctx: serde_json::Value = serde_json::from_str(context).unwrap_or_default();
+    let ctx: serde_json::Value = match serde_json::from_str(context) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("DEBUG: encode_scope: failed to parse context JSON: {}", e);
+            serde_json::Value::default()
+        }
+    };
     let path = ctx
         .get("path")
         .or_else(|| ctx.get("command"))
@@ -203,19 +213,20 @@ pub fn encode_policy(
 ) -> Vec<i32> {
     let mut features = vec![0i32; input_width];
 
-    // One-hot action type (slots 0-4)
-    match action {
-        "run_command" => features[0] = SCALE_MULTIPLIER,
-        "send_email" => features[1] = SCALE_MULTIPLIER,
-        "read_file" => features[2] = SCALE_MULTIPLIER,
-        "write_file" => features[3] = SCALE_MULTIPLIER,
-        "network_request" => features[4] = SCALE_MULTIPLIER,
-        _ => {}
+    // One-hot action type (slots 0-4) via ActionType enum
+    if let Some(at) = ActionType::from_str_opt(action) {
+        features[at.one_hot_index()] = SCALE_MULTIPLIER;
     }
 
     // Condition slots
     if let Some(policy) = policy {
-        let ctx: serde_json::Value = serde_json::from_str(context).unwrap_or_default();
+        let ctx: serde_json::Value = match serde_json::from_str(context) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("DEBUG: encode_policy: failed to parse context JSON: {}", e);
+                serde_json::Value::default()
+            }
+        };
         let url = ctx.get("url").and_then(|v| v.as_str()).unwrap_or("");
         let path = ctx.get("path").and_then(|v| v.as_str()).unwrap_or("");
         let command = ctx.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -232,8 +243,15 @@ pub fn encode_policy(
                     lower.contains(&cond.pattern.to_lowercase())
                 }
                 crate::rules::ConditionKind::Path => {
-                    let pat = cond.pattern.trim_start_matches('~').to_lowercase();
-                    lower.contains(&pat)
+                    let pat = cond.pattern.to_lowercase();
+                    // Support basic glob: *.ext matches any path ending with .ext
+                    if pat.starts_with('*') {
+                        let suffix = pat.trim_start_matches('*');
+                        lower.contains(&suffix)
+                    } else {
+                        let cleaned = pat.trim_start_matches('~');
+                        lower.contains(cleaned)
+                    }
                 }
                 crate::rules::ConditionKind::Keyword => {
                     lower.contains(&cond.pattern.to_lowercase())

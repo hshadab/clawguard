@@ -41,6 +41,9 @@ enforcement = "hard"
 # Max trace length for ZK proving (auto-detected if omitted)
 # max_trace_length = 16384
 
+# Max history file size in bytes before rotation (default: 10MB)
+# max_history_bytes = 10485760
+
 # User-defined policy rules — compiled into model weights for ZK proving
 # Each rule becomes a hidden neuron in a policy model.
 
