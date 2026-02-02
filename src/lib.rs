@@ -85,6 +85,25 @@ pub fn history_path(config: Option<&GuardsConfig>) -> PathBuf {
 
 pub fn load_config() -> Option<GuardsConfig> {
     let config_path = config_dir().join("config.toml");
+
+    // Warn if config file is world-writable (Unix only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(&config_path) {
+            let mode = metadata.permissions().mode();
+            if mode & 0o002 != 0 {
+                eprintln!(
+                    "WARNING: config file {} is world-writable (mode {:o}). \
+                     Consider running: chmod o-w {}",
+                    config_path.display(),
+                    mode & 0o777,
+                    config_path.display()
+                );
+            }
+        }
+    }
+
     let content = fs::read_to_string(config_path).ok()?;
     toml::from_str(&content).ok()
 }
@@ -182,7 +201,10 @@ pub fn rotate_history_if_needed(config: Option<&GuardsConfig>) {
 
     let metadata = match fs::metadata(&hist) {
         Ok(m) => m,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("WARNING: failed to read history file metadata: {}", e);
+            return;
+        }
     };
 
     if metadata.len() <= max_bytes {
@@ -192,7 +214,10 @@ pub fn rotate_history_if_needed(config: Option<&GuardsConfig>) {
     // Read all lines, keep the most recent half
     let content = match fs::read_to_string(&hist) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("WARNING: failed to read history file for rotation: {}", e);
+            return;
+        }
     };
     let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
     let keep_from = lines.len() / 2;
@@ -201,7 +226,9 @@ pub fn rotate_history_if_needed(config: Option<&GuardsConfig>) {
         .map(|l| format!("{}\n", l))
         .collect();
 
-    let _ = fs::write(&hist, kept);
+    if let Err(e) = fs::write(&hist, kept) {
+        eprintln!("WARNING: failed to write rotated history file: {}", e);
+    }
     eprintln!(
         "INFO: rotated history file (dropped {} old entries, kept {})",
         keep_from,
@@ -447,16 +474,19 @@ pub fn run_guardrail(
 
     let model = model_fn();
     let result = model
-        .forward(&[input.clone()])
+        .forward(std::slice::from_ref(&input))
         .map_err(|e| eyre::eyre!("forward error: {}", e))?;
-    let output = result.outputs[0].clone();
-    let data = &output.inner;
+    let data = &result.outputs[0].inner;
+
+    if labels.len() < 2 {
+        bail!("model labels must have at least 2 entries, got {}", labels.len());
+    }
 
     let (decision, confidence) = if data.len() >= 2 {
         let margin = (data[0] - data[1]).abs();
         let conf = (margin as f64 / 128.0).min(1.0);
         if data[0] > data[1] {
-            (labels.first().cloned().unwrap_or_default(), conf)
+            (labels.get(0).cloned().unwrap_or_default(), conf)
         } else {
             (labels.get(1).cloned().unwrap_or_default(), conf)
         }

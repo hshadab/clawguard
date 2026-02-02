@@ -40,7 +40,7 @@ pub fn encode_action(action: &str, context: &str) -> Vec<i32> {
     let ctx: serde_json::Value = match serde_json::from_str(context) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("DEBUG: encode_action: failed to parse context JSON: {}", e);
+            eprintln!("WARNING: encode_action: failed to parse context JSON: {}", e);
             serde_json::Value::default()
         }
     };
@@ -57,7 +57,7 @@ pub fn encode_action(action: &str, context: &str) -> Vec<i32> {
     if let Some(at) = ActionType::from_str_opt(action) {
         features[at.one_hot_index()] = SCALE_MULTIPLIER;
     } else {
-        eprintln!("DEBUG: encode_action: unknown action type '{}'", action);
+        eprintln!("WARNING: encode_action: unknown action type '{}'", action);
     }
 
     // Binary features from context
@@ -136,7 +136,7 @@ pub fn encode_scope(_action: &str, context: &str) -> Vec<i32> {
     let ctx: serde_json::Value = match serde_json::from_str(context) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("DEBUG: encode_scope: failed to parse context JSON: {}", e);
+            eprintln!("WARNING: encode_scope: failed to parse context JSON: {}", e);
             serde_json::Value::default()
         }
     };
@@ -223,7 +223,7 @@ pub fn encode_policy(
         let ctx: serde_json::Value = match serde_json::from_str(context) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("DEBUG: encode_policy: failed to parse context JSON: {}", e);
+                eprintln!("WARNING: encode_policy: failed to parse context JSON: {}", e);
                 serde_json::Value::default()
             }
         };

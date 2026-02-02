@@ -4,32 +4,25 @@ use eyre::Result;
 use onnx_tracer::graph::model::Model;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, RwLock};
 
 // ---------------------------------------------------------------------------
-// OnceLock + Mutex for ONNX model path (Step 3.1)
+// RwLock for ONNX model path
 // ---------------------------------------------------------------------------
 
-static ONNX_MODEL_PATH: OnceLock<Mutex<PathBuf>> = OnceLock::new();
+static ONNX_MODEL_PATH: LazyLock<RwLock<Option<PathBuf>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 pub fn set_onnx_path(path: PathBuf) {
-    match ONNX_MODEL_PATH.get() {
-        Some(mutex) => {
-            *mutex.lock().unwrap() = path;
-        }
-        None => {
-            let _ = ONNX_MODEL_PATH.set(Mutex::new(path));
-        }
-    }
+    *ONNX_MODEL_PATH.write().unwrap() = Some(path);
 }
 
 pub fn load_onnx_model() -> Model {
-    let path = ONNX_MODEL_PATH
-        .get()
-        .expect("ONNX path not set — call set_onnx_path() first")
-        .lock()
-        .unwrap();
-    onnx_tracer::model(&*path)
+    let guard = ONNX_MODEL_PATH.read().unwrap();
+    let path = guard
+        .as_ref()
+        .expect("ONNX path not set — call set_onnx_path() first");
+    onnx_tracer::model(path)
 }
 
 // ---------------------------------------------------------------------------

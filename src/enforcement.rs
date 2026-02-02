@@ -127,9 +127,8 @@ impl Guardrail {
             .unwrap_or(false);
 
         let context_str = serde_json::to_string(context).unwrap_or_default();
-        let cfg = Some(self.config.clone());
 
-        let result = run_guardrail(model, action, &context_str, require_proof, cfg.as_ref());
+        let result = run_guardrail(model, action, &context_str, require_proof, Some(&self.config));
 
         match result {
             Ok((decision, confidence, model_hash, _proof_path)) => {
@@ -175,18 +174,11 @@ impl ActionGuard for Guardrail {
             GuardModel::ScopeGuard,
         ];
 
-        // Filter models to only those applicable to this action type (Issue 9)
-        let models_to_check: Vec<&GuardModel> = if self.config.models.is_some() {
-            builtin_models
-                .iter()
-                .filter(|m| m.applicable_actions().contains(&action))
-                .collect()
-        } else {
-            builtin_models
-                .iter()
-                .filter(|m| m.applicable_actions().contains(&action))
-                .collect()
-        };
+        // Filter models to only those whose applicable actions include this action type
+        let models_to_check: Vec<&GuardModel> = builtin_models
+            .iter()
+            .filter(|m| m.applicable_actions().contains(&action))
+            .collect();
 
         for model in models_to_check {
             let decision = self.check(model, action, context)?;

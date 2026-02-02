@@ -297,10 +297,18 @@ fn main() {
         if let Some(rule_configs) = &config.rules {
             let policy_rules: Vec<clawguard::rules::PolicyRule> = rule_configs
                 .iter()
-                .filter_map(|rc| clawguard::rules::PolicyRule::from_config(rc).ok())
+                .filter_map(|rc| match clawguard::rules::PolicyRule::from_config(rc) {
+                    Ok(rule) => Some(rule),
+                    Err(e) => {
+                        eprintln!("WARNING: failed to load policy rule '{}': {}", rc.name, e);
+                        None
+                    }
+                })
                 .collect();
             if !policy_rules.is_empty() {
-                let _ = clawguard::rules::init_policy(&policy_rules);
+                if !clawguard::rules::init_policy(&policy_rules) {
+                    eprintln!("WARNING: policy rules already initialized, skipping re-init");
+                }
             }
         }
     }
