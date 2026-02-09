@@ -19,6 +19,7 @@ Three guardrail models are available out of the box. Select the model by passing
 | `action-gatekeeper` | Dangerous commands (sudo, pipes, dotfile writes) | DENIED / APPROVED |
 | `pii-shield` | PII in text (SSN, email, phone, CC, passwords) | PII_DETECTED / CLEAN |
 | `scope-guard` | File access outside workspace | OUT_OF_SCOPE / IN_SCOPE |
+| `skill-safety` | Malicious/dangerous OpenClaw skills | SAFE / CAUTION / DANGEROUS / MALICIOUS |
 
 ## When to Use
 
@@ -109,14 +110,21 @@ clawguard history [--limit N]
 
 # Show available guardrail models
 clawguard models
+
+# Validate config file
+clawguard config-check [--ignore-config-errors]
+
+# Manage proof migrations when models update
+clawguard migrate-proofs [--dry-run] [--archive]
 ```
 
-### Model Selection by Filename
+### Model Selection
 
-The `--model` argument matches on filename keywords:
-- Contains `action` or `gatekeeper` -> action-gatekeeper
-- Contains `pii` or `shield` -> pii-shield
-- Contains `scope` -> scope-guard
+The `--model` argument accepts exact model names:
+- `action-gatekeeper` or `action_gatekeeper` -> action-gatekeeper
+- `pii-shield` or `pii_shield` -> pii-shield
+- `scope-guard` or `scope_guard` -> scope-guard
+- `skill-safety` or `skill_safety` -> skill-safety
 - Otherwise, attempts to load as a real ONNX file from the path
 
 ### Enforcement Levels
@@ -188,3 +196,213 @@ let decision = guardrail.check(&GuardModel::ActionGatekeeper, "run_command", &co
 - Proofs are stored locally and can be shared with third parties for independent verification
 - The proof reveals NOTHING about the user's data — only that a specific model produced a specific decision
 - With `enforcement = "hard"`, a denied action exits with code 1 — treat this as a hard stop
+
+---
+
+## Skill Safety Guardrail
+
+ClawGuard includes a specialized guardrail for evaluating OpenClaw/ClawHub skills before installation. This helps protect against malicious skills that may contain:
+
+- **Reverse shells** and backdoors
+- **Credential exfiltration** from `.env` files
+- **LLM context window attacks** (instructing the agent to pass secrets through plaintext)
+- **Obfuscated payloads** designed to evade scanners
+- **Persistence mechanisms** (cron jobs, systemd services)
+
+### Scanning a Skill
+
+```bash
+# Scan a skill from a JSON file
+clawguard scan-skill --input skill.json
+
+# Scan a local SKILL.md file
+clawguard scan-skill --input ./my-skill/SKILL.md
+
+# Scan with VirusTotal report
+clawguard scan-skill --input skill.json --vt-report vt-report.json
+
+# Generate ZK proof for the scan
+clawguard scan-skill --input skill.json --prove
+
+# Output as JSON
+clawguard scan-skill --input skill.json --format json
+
+# Output full receipt
+clawguard scan-skill --input skill.json --prove --format receipt
+
+# Save receipt to file
+clawguard scan-skill --input skill.json --prove --output receipt.json
+```
+
+### Classification Levels
+
+| Class | Decision | Description |
+|-------|----------|-------------|
+| `SAFE` | allow | No concerning patterns detected |
+| `CAUTION` | allow | Minor concerns (network calls, env reads) but likely functional |
+| `DANGEROUS` | deny | Significant risk (credential exposure, excessive permissions) |
+| `MALICIOUS` | deny | Active malware indicators (reverse shells, obfuscation) |
+
+### 22-Feature Analysis
+
+The skill safety classifier analyzes 22 features:
+
+1. **Shell execution** patterns (exec, spawn, system)
+2. **Network calls** (fetch, curl, axios)
+3. **File writes** to disk
+4. **Environment access** (.env, process.env)
+5. **Credential patterns** in instructions (API key, password, token)
+6. **External downloads** of executables
+7. **Obfuscation** (base64, eval, dynamic imports)
+8. **Privilege escalation** (sudo, chmod)
+9. **Persistence mechanisms** (cron, systemd, autostart)
+10. **Data exfiltration** patterns (POST to external domains)
+11. **SKILL.md complexity** (line count)
+12. **Script file count**
+13. **Dependency count**
+14. **Author account age**
+15. **Author skill count**
+16. **Stars/endorsements**
+17. **Download count**
+18. **VirusTotal report** presence
+19. **VirusTotal malicious flags**
+20. **Password-protected archives** (scanner evasion)
+21. **Reverse shell patterns** (nc -e, /dev/tcp, bash -i)
+22. **LLM secret exposure** (instructions to pass secrets through context)
+
+### Example Output
+
+```
+Skill Safety Scan Results
+========================
+Skill: moltyverse-email v1.1.0
+
+Classification: DANGEROUS
+Decision:       deny
+Confidence:     87.0%
+Reasoning:      Significant risk patterns detected
+
+Scores:
+  SAFE:       3.0%
+  CAUTION:    8.0%
+  DANGEROUS:  87.0%
+  MALICIOUS:  2.0%
+
+Risk Factors:
+  - llm_secret_exposure: true (SKILL.md instructs passing secrets through context)
+  - credential_patterns: 6 (API key, password, token references)
+  - env_access_count: 8 (heavy .env usage)
+
+Receipt ID: gr_safety_7f3a9b2e1d4c
+Model Hash: sha256:a4c8e2f1b3d7...
+```
+
+### Prover Service
+
+Run ClawGuard as an HTTP service for remote skill evaluation:
+
+```bash
+# Start the prover service
+clawguard serve --bind 127.0.0.1:8080
+
+# With proof generation enabled
+clawguard serve --bind 0.0.0.0:8080 --require-proof
+
+# Limit concurrent proofs
+clawguard serve --bind 127.0.0.1:8080 --max-proofs 2
+
+# Configure rate limiting (requests per minute per IP, default: 60)
+clawguard serve --bind 127.0.0.1:8080 --rate-limit 120
+```
+
+**Endpoints:**
+
+- `GET /health` — Health check with model hash and uptime
+- `POST /guardrail/safety` — Evaluate skill safety
+
+**Request format:**
+
+```json
+{
+  "skill": {
+    "name": "my-skill",
+    "version": "1.0.0",
+    "author": "developer",
+    "skill_md": "# My Skill\n\n...",
+    "scripts": [],
+    "metadata": {
+      "stars": 100,
+      "downloads": 5000,
+      "author_account_created": "2024-01-01T00:00:00Z",
+      "author_total_skills": 10
+    },
+    "files": []
+  },
+  "vt_report": null,
+  "generate_proof": false
+}
+```
+
+**Response format:**
+
+```json
+{
+  "success": true,
+  "receipt": {
+    "version": "1.0.0",
+    "receipt_id": "gr_safety_abc123",
+    "guardrail": {
+      "domain": "safety",
+      "action_type": "install_skill",
+      "policy_id": "icme:skill-safety-v1",
+      "model_hash": "sha256:..."
+    },
+    "evaluation": {
+      "decision": "allow",
+      "classification": "SAFE",
+      "confidence": 0.85,
+      "scores": {
+        "SAFE": 0.85,
+        "CAUTION": 0.12,
+        "DANGEROUS": 0.02,
+        "MALICIOUS": 0.01
+      }
+    },
+    "proof": {
+      "system": "jolt-atlas",
+      "proof_bytes": "...",
+      "verification_key_hash": "sha256:..."
+    }
+  },
+  "processing_time_ms": 150
+}
+```
+
+### Pre-Install Hook Integration
+
+For OpenClaw agents, integrate skill safety as a pre-install check:
+
+```rust
+use clawguard::{run_skill_safety, skill::SkillFeatures};
+
+// Before installing any skill:
+let features = SkillFeatures::extract(&skill, None);
+let (classification, confidence, model_hash, proof_path) =
+    run_skill_safety(&features, true, None)?;
+
+if classification.is_deny() {
+    eprintln!("Blocked installation of {}: {}", skill.name, classification.as_str());
+    return Err(format!("Safety guardrail blocked skill"));
+}
+```
+
+### Receipt Verification
+
+Receipts are cryptographically verifiable:
+
+1. **Nonce uniqueness** — Receipt ID has not appeared before
+2. **Model binding** — Model hash matches registered on-chain model
+3. **Input binding** — Feature commitment matches extracted features
+4. **Proof verification** — ZK proof validates with verification key
+5. **Payment binding** — (if x402) Transaction exists on-chain
+6. **Output consistency** — Classification maps correctly to decision

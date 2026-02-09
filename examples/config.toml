@@ -57,3 +57,20 @@ name = "protect-secrets"
 block_paths = ["~/.ssh", "~/.gnupg", "~/.aws", "*.env"]
 block_keywords = ["password", "secret", "api_key"]
 actions = ["read_file", "write_file", "run_command"]
+
+# Skill safety settings
+[skill_safety]
+# Automatically scan skills before installation
+auto_scan = true
+
+# Block installation of DANGEROUS or MALICIOUS skills
+block_unsafe = true
+
+# Generate ZK proofs for skill scans
+require_proof = false
+
+# Directory to store skill safety receipts
+receipts_dir = "~/.openclaw/clawguard/receipts/safety"
+
+# Directory to store flagged skill reports
+flagged_dir = "~/.openclaw/clawguard/flagged/safety"

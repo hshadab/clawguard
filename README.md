@@ -38,9 +38,9 @@ Now imagine instead you say: "Run sudo rm -rf / | tee log.txt"
   6. A proof is saved showing the denial was legitimate
 ```
 
-### Three built-in safety checks
+### Four built-in safety checks
 
-ClawGuard comes with three checks that work immediately, no setup required:
+ClawGuard comes with four checks that work immediately, no setup required:
 
 **Action Gatekeeper** — "Is this command dangerous?"
 Catches things like `sudo` with pipes, shell injection patterns, and writes to hidden system files. A plain `cat README.md` sails through. A `sudo rm -rf / | tee log.txt` gets blocked.
@@ -50,6 +50,9 @@ Scans for social security numbers, credit card numbers, email addresses, phone n
 
 **Scope Guard** — "Is this file access within bounds?"
 Blocks your OpenClaw agent from reading `/etc/passwd`, poking around in `~/.ssh`, or using `../../../` to escape the project directory. Keeps file access inside your workspace.
+
+**Skill Safety** — "Is this OpenClaw skill safe to install?"
+Analyzes ClawHub skills before installation, detecting malicious patterns like reverse shells, credential exfiltration, LLM context window attacks, and obfuscated payloads. Classifies skills as SAFE, CAUTION, DANGEROUS, or MALICIOUS.
 
 ### You can also write your own rules
 
@@ -229,6 +232,139 @@ clawguard models
 # View recent check history
 clawguard history --limit 5
 ```
+
+---
+
+## Skill Safety: Scanning ClawHub Skills
+
+Before installing any skill from ClawHub, scan it for malicious patterns:
+
+```bash
+# Scan a skill from JSON
+clawguard scan-skill --input skill.json
+
+# Scan with detailed JSON output
+clawguard scan-skill --input skill.json --format json
+
+# Generate a ZK proof receipt
+clawguard scan-skill --input skill.json --prove --output receipt.json
+```
+
+### What it detects
+
+The skill safety classifier analyzes 22 features including:
+
+- **Reverse shells** — `nc -e`, `/dev/tcp`, `bash -i`
+- **Credential exfiltration** — reading `.env` files, posting to external servers
+- **LLM context attacks** — instructions to pass secrets through the context window
+- **Obfuscation** — base64 encoding, `eval()`, dynamic imports
+- **Persistence** — cron jobs, systemd services, shell profile modifications
+- **Privilege escalation** — `sudo`, `chmod 777`
+- **Scanner evasion** — password-protected archives
+
+### Classification levels
+
+| Class | Decision | What it means |
+|-------|----------|---------------|
+| **SAFE** | allow | No concerning patterns |
+| **CAUTION** | allow | Minor concerns, likely functional |
+| **DANGEROUS** | deny | Credential exposure, excessive permissions |
+| **MALICIOUS** | deny | Active malware indicators |
+
+### Example output
+
+```
+Skill Safety Scan Results
+========================
+Skill: env-manager v1.2.0
+
+Classification: DANGEROUS
+Decision:       deny
+Confidence:     100.0%
+
+Scores:
+  SAFE:       0.0%
+  CAUTION:    0.3%
+  DANGEROUS:  99.7%
+  MALICIOUS:  0.0%
+
+Risk Factors:
+  - llm_secret_exposure: true
+  - credential_patterns: 2
+  - data_exfiltration_patterns: 1
+```
+
+### HTTP Prover Service
+
+Run ClawGuard as an HTTP service for remote skill evaluation:
+
+```bash
+clawguard serve --bind 0.0.0.0:8080
+```
+
+#### Rate Limiting
+
+The server includes per-IP rate limiting to prevent abuse:
+
+```bash
+# Default: 60 requests per minute per IP
+clawguard serve --bind 0.0.0.0:8080
+
+# Custom rate limit
+clawguard serve --bind 0.0.0.0:8080 --rate-limit 120
+```
+
+When rate limited, clients receive a 429 Too Many Requests response.
+
+Then POST to `/guardrail/safety`:
+
+```bash
+curl -X POST http://localhost:8080/guardrail/safety \
+  -H "Content-Type: application/json" \
+  -d '{"skill": {...}, "generate_proof": false}'
+```
+
+### Verifying Receipts
+
+Anyone can verify a receipt without trusting the prover. This is the power of ZK proofs:
+
+```bash
+# Basic verification (checks schema, nonce, model hash, decision consistency)
+clawguard verify-receipt --input receipt.json
+
+# Verify that receipt matches a specific skill file
+clawguard verify-receipt --input receipt.json --skill skill.json
+
+# Full verification including ZK proof
+clawguard verify-receipt --input receipt.json --verify-proof
+```
+
+The verifier checks:
+1. **Schema validity** — Receipt version matches expected format
+2. **Nonce format** — 32-byte hex nonce for replay protection
+3. **Model binding** — Model hash matches a known registered model
+4. **Input binding** — If skill provided, commitment matches extracted features
+5. **Decision consistency** — DANGEROUS/MALICIOUS → deny, SAFE/CAUTION → allow
+6. **Proof validity** — ZK proof verifies (if `--verify-proof` enabled)
+
+### Proof Migration
+
+When model weights or architecture change, existing proofs become invalid. ClawGuard provides tools to detect and manage this:
+
+```bash
+# Scan proof directory for outdated proofs
+clawguard migrate-proofs --dry-run
+
+# Archive old proofs to a subdirectory
+clawguard migrate-proofs --archive
+```
+
+The migration tool checks:
+- **Model hash mismatch** — Proof was generated with a different model version
+- **Format version** — Proof schema has changed incompatibly
+- **Supported versions** — Older but still valid proof formats
+
+Old proofs are moved to `proofs/archived/` rather than deleted, preserving audit history.
 
 ---
 
@@ -418,6 +554,15 @@ clawguard check --model <name> --action <type> --context '<json>' --dry-run
 # Check an action and generate a ZK proof
 clawguard check --model <name> --action <type> --context '<json>' --prove
 
+# Scan a skill for safety issues
+clawguard scan-skill --input <path> [--prove] [--format json|summary|receipt]
+
+# Verify a guardrail receipt (trustless verification)
+clawguard verify-receipt --input <receipt.json> [--skill <skill.json>] [--verify-proof]
+
+# Start HTTP prover service
+clawguard serve --bind <addr:port> [--max-proofs N] [--rate-limit RPM]
+
 # Verify a saved proof file
 clawguard verify --proof <path> --model-hash <hash> --model-name <name>
 
@@ -428,13 +573,17 @@ clawguard history [--limit N]
 clawguard models
 
 # Validate your config file
-clawguard config-check
+clawguard config-check [--ignore-config-errors]
+
+# Scan proofs for migration (when model versions change)
+clawguard migrate-proofs [--dry-run] [--archive]
 ```
 
 **Model names** for the `--model` flag:
 - `action-gatekeeper` — command safety
 - `pii-shield` — personal data detection
 - `scope-guard` — file access boundaries
+- `skill-safety` — ClawHub skill analysis
 - Or a path to a real ONNX file
 
 **Action types** for the `--action` flag:
@@ -443,6 +592,7 @@ clawguard config-check
 - `read_file` — reading files
 - `write_file` — writing files
 - `network_request` — HTTP/network calls
+- `install_skill` — skill installation
 
 ---
 
@@ -458,6 +608,12 @@ require_proof = true              # always generate ZK proofs
 deny_on_error = true              # treat model errors as denials
 proof_dir = "~/.openclaw/clawguard/proofs"
 # max_trace_length = 16384       # ZK trace length (auto-detected if omitted)
+
+# --- Config validation ---
+# Run `clawguard config-check` to validate your configuration.
+# Errors (missing required fields, invalid paths) cause check to fail.
+# Warnings (deprecated options, suboptimal settings) are reported but pass.
+# Use --ignore-config-errors to suppress errors during development.
 
 # --- Custom ONNX models ---
 [models.my-custom-model]
@@ -544,11 +700,17 @@ The pipeline halts at an approval gate if the guardrail denies, with a 5-minute 
 ## Running Tests
 
 ```bash
-# Unit tests — instant, covers all 3 built-in models + policy rule compilation
+# Unit tests — instant, covers all 4 built-in models + policy rule compilation
 cargo test --lib
 
-# Integration test — full ZK prove-and-verify round trip + enforcement library
+# Integration tests — encoding edge cases, config validation, enforcement
 cargo test --test integration --release
+
+# CLI tests — command-line interface behavior
+cargo test --test cli
+
+# All tests
+cargo test --all
 ```
 
 ---
@@ -593,15 +755,25 @@ src/
     rules.rs           -- Policy rule parsing and compilation to neural network weights
     onnx_support.rs    -- ONNX model loading and metadata
     encoding.rs        -- Turns actions/context into model input vectors
+    patterns.rs        -- Shared regex patterns (SSN, email, phone, etc.)
     proving.rs         -- ZK proof generation and verification via JoltSNARK
+    migration.rs       -- Proof version migration utilities
+    skill.rs           -- Skill data structures, 22-feature extraction, VT report parsing
+    receipt.rs         -- GuardrailReceipt schema, cryptographic commitments
+    server.rs          -- HTTP prover service (axum-based REST API, rate limiting)
     models/
       action_gatekeeper.rs  -- Command safety classifier
       pii_shield.rs         -- Personal data detector
       scope_guard.rs        -- File access boundary enforcer
-  tests/
+      skill_safety.rs       -- ClawHub skill safety classifier (22→32→32→4 MLP)
+tests/
     integration.rs     -- End-to-end prove-verify round trip + enforcement test
-  examples/
+    cli.rs             -- CLI command integration tests
+examples/
     config.toml        -- Full working configuration example
+    skill-safe.json    -- Example safe skill for testing
+    skill-dangerous.json -- Example dangerous skill for testing
+    skill-malicious.json -- Example malicious skill for testing
 ```
 
 ## License

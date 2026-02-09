@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use clawguard::{
     enforcement::EnforcementLevel,
     history_path, is_deny_decision, load_config, rotate_history_if_needed, run_guardrail,
-    validate_config, GuardModel,
+    run_skill_safety, validate_config, config_has_errors, GuardModel,
+    receipt::{FlaggedSkill, GuardrailReceipt, ClassScores, generate_nonce},
+    skill::{Skill, SkillFeatures, VTReport, derive_decision, skill_from_skill_md},
 };
 
 #[derive(Parser)]
@@ -73,7 +75,83 @@ enum Commands {
     Models,
 
     /// Validate the config file and report any issues
-    ConfigCheck,
+    ConfigCheck {
+        /// Ignore config errors (exit 0 even if errors found)
+        #[arg(long, default_value_t = false)]
+        ignore_config_errors: bool,
+    },
+
+    /// Scan a skill for safety issues
+    ScanSkill {
+        /// Path to a SKILL.md file or JSON skill definition
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Path to optional VirusTotal report JSON
+        #[arg(long)]
+        vt_report: Option<PathBuf>,
+
+        /// Generate a zero-knowledge proof
+        #[arg(long, default_value_t = false)]
+        prove: bool,
+
+        /// Output format: json, summary, or receipt
+        #[arg(long, default_value = "summary")]
+        format: String,
+
+        /// Save receipt to file
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Start the HTTP prover service
+    Serve {
+        /// Address to bind to
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: String,
+
+        /// Maximum concurrent proof generations
+        #[arg(long, default_value_t = 4)]
+        max_proofs: usize,
+
+        /// Require proof generation for all requests
+        #[arg(long, default_value_t = false)]
+        require_proof: bool,
+
+        /// Rate limit in requests per minute per IP (0 = no limit)
+        #[arg(long, default_value_t = 60)]
+        rate_limit: u32,
+    },
+
+    /// Verify a guardrail receipt
+    VerifyReceipt {
+        /// Path to the receipt JSON file
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Optional path to skill JSON to verify input commitment
+        #[arg(long)]
+        skill: Option<PathBuf>,
+
+        /// Verify the ZK proof (requires model to be available)
+        #[arg(long, default_value_t = false)]
+        verify_proof: bool,
+    },
+
+    /// Manage proof migrations after model updates
+    MigrateProofs {
+        /// Directory containing proof files (defaults to config proof_dir)
+        #[arg(long)]
+        proof_dir: Option<PathBuf>,
+
+        /// Only show what would be done, don't actually archive
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Archive old proofs instead of just scanning
+        #[arg(long, default_value_t = false)]
+        archive: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -94,6 +172,51 @@ struct VerifyResult {
     valid: bool,
     model_hash_matches: bool,
     proof_file: String,
+}
+
+/// Result of receipt verification
+#[derive(Serialize)]
+struct ReceiptVerifyResult {
+    /// Overall verification status
+    valid: bool,
+    /// Receipt ID being verified
+    receipt_id: String,
+    /// Individual check results
+    checks: ReceiptChecks,
+    /// Warnings (non-fatal issues)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+    /// Errors (fatal issues)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ReceiptChecks {
+    /// Schema version is valid
+    schema_valid: bool,
+    /// Nonce format is valid
+    nonce_valid: bool,
+    /// Model hash matches a known model
+    model_known: bool,
+    /// Model hash from receipt
+    model_hash: String,
+    /// Input commitment format is valid
+    commitment_valid: bool,
+    /// Input commitment matches provided skill (if skill provided)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commitment_matches: Option<bool>,
+    /// Decision is consistent with classification
+    decision_consistent: bool,
+    /// ZK proof verified (if verify_proof enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof_valid: Option<bool>,
+    /// Classification from receipt
+    classification: String,
+    /// Decision from receipt
+    decision: String,
+    /// Confidence score
+    confidence: f64,
 }
 
 /// Returns an exit code: 0 for success/soft, 1 for hard denial.
@@ -227,6 +350,7 @@ fn cmd_models() -> Result<()> {
     println!("  action-gatekeeper  — blocks dangerous command patterns (sudo, pipes)");
     println!("  pii-shield         — detects PII (SSN, email, phone, CC, passwords)");
     println!("  scope-guard        — blocks file access outside workspace");
+    println!("  skill-safety       — classifies OpenClaw skills (SAFE/CAUTION/DANGEROUS/MALICIOUS)");
     println!();
 
     let config = load_config();
@@ -255,13 +379,13 @@ fn cmd_models() -> Result<()> {
     Ok(())
 }
 
-fn cmd_config_check() -> Result<()> {
+fn cmd_config_check(ignore_errors: bool) -> Result<i32> {
     let config_path = clawguard::config_dir().join("config.toml");
     println!("Config path: {}", config_path.display());
 
     if !config_path.exists() {
         println!("No config file found. Using defaults.");
-        return Ok(());
+        return Ok(0);
     }
 
     let content = fs::read_to_string(&config_path)
@@ -274,18 +398,571 @@ fn cmd_config_check() -> Result<()> {
         }
         Err(e) => {
             eprintln!("ERROR: failed to parse config: {}", e);
-            return Ok(());
+            return Ok(if ignore_errors { 0 } else { 1 });
         }
     };
 
     let issues = validate_config(&config);
+    let has_errors = config_has_errors(&issues);
+
     if issues.is_empty() {
         println!("All checks passed.");
     } else {
+        let error_count = issues.iter().filter(|i| i.is_error()).count();
+        let warning_count = issues.len() - error_count;
+
         for issue in &issues {
             println!("  {}", issue);
         }
-        println!("\n{} issue(s) found.", issues.len());
+
+        println!();
+        if error_count > 0 {
+            println!("{} error(s), {} warning(s) found.", error_count, warning_count);
+        } else {
+            println!("{} warning(s) found.", warning_count);
+        }
+    }
+
+    if has_errors && !ignore_errors {
+        Ok(1)
+    } else {
+        Ok(0)
+    }
+}
+
+/// Result for scan-skill command
+#[derive(Serialize)]
+struct ScanSkillResult {
+    skill_name: String,
+    skill_version: String,
+    classification: String,
+    decision: String,
+    confidence: f64,
+    reasoning: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof_generated: Option<bool>,
+    features: SkillFeatures,
+    model_hash: String,
+    timestamp: String,
+}
+
+fn cmd_scan_skill(
+    input: PathBuf,
+    vt_report_path: Option<PathBuf>,
+    prove: bool,
+    format: String,
+    output: Option<PathBuf>,
+) -> Result<i32> {
+    let config = load_config();
+
+    // Load skill from input
+    let skill: Skill = if input.extension().map(|e| e == "json").unwrap_or(false) {
+        let content = fs::read_to_string(&input)?;
+        serde_json::from_str(&content)?
+    } else {
+        // Assume SKILL.md format
+        skill_from_skill_md(&input)?
+    };
+
+    // Load optional VT report
+    let vt_report: Option<VTReport> = if let Some(vt_path) = vt_report_path {
+        let content = fs::read_to_string(&vt_path)?;
+        Some(serde_json::from_str(&content)?)
+    } else {
+        None
+    };
+
+    // Extract features
+    let features = SkillFeatures::extract(&skill, vt_report.as_ref());
+
+    // Run safety classification
+    let (classification, confidence, model_hash, proof_path) =
+        run_skill_safety(&features, prove, config.as_ref())?;
+
+    // Derive decision
+    let feature_vec = features.to_normalized_vec();
+    let scores = compute_scores(&feature_vec)?;
+    let scores_array = [scores.safe, scores.caution, scores.dangerous, scores.malicious];
+    let (decision, reasoning) = derive_decision(classification, &scores_array);
+
+    // Create receipt if proof was generated
+    let receipt = if prove {
+        let (proof_bytes, program_io) = if let Some(ref path) = proof_path {
+            let content = fs::read_to_string(path)?;
+            let json: serde_json::Value = serde_json::from_str(&content)?;
+            let bytes = json.get("proof").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let io = json.get("program_io").and_then(|v| v.as_str()).map(|s| s.to_string());
+            (bytes, io)
+        } else {
+            (String::new(), None)
+        };
+
+        Some(GuardrailReceipt::new_safety_receipt(
+            &skill.name,
+            &skill.version,
+            &features,
+            classification,
+            decision,
+            &reasoning,
+            scores.clone(),
+            confidence,
+            model_hash.clone(),
+            proof_bytes,
+            model_hash.clone(),
+            None,
+            program_io,
+            generate_nonce(),
+        ))
+    } else {
+        None
+    };
+
+    // Format output
+    match format.as_str() {
+        "json" => {
+            let result = ScanSkillResult {
+                skill_name: skill.name.clone(),
+                skill_version: skill.version.clone(),
+                classification: classification.as_str().to_string(),
+                decision: decision.as_str().to_string(),
+                confidence,
+                reasoning: reasoning.clone(),
+                receipt_id: receipt.as_ref().map(|r| r.receipt_id.clone()),
+                proof_generated: if prove { Some(true) } else { None },
+                features: features.clone(),
+                model_hash: model_hash.clone(),
+                timestamp: Utc::now().to_rfc3339(),
+            };
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        "receipt" => {
+            if let Some(ref r) = receipt {
+                println!("{}", serde_json::to_string_pretty(r)?);
+            } else {
+                eprintln!("No receipt generated. Use --prove to generate a receipt.");
+            }
+        }
+        _ => {
+            // Summary format
+            println!("Skill Safety Scan Results");
+            println!("========================");
+            println!("Skill: {} v{}", skill.name, skill.version);
+            println!();
+            println!("Classification: {}", classification.as_str());
+            println!("Decision:       {}", decision.as_str());
+            println!("Confidence:     {:.1}%", confidence * 100.0);
+            println!("Reasoning:      {}", reasoning);
+            println!();
+            println!("Scores:");
+            println!("  SAFE:       {:.1}%", scores.safe * 100.0);
+            println!("  CAUTION:    {:.1}%", scores.caution * 100.0);
+            println!("  DANGEROUS:  {:.1}%", scores.dangerous * 100.0);
+            println!("  MALICIOUS:  {:.1}%", scores.malicious * 100.0);
+            println!();
+
+            if classification.is_deny() {
+                let flagged = FlaggedSkill::from_scan(
+                    &skill.name,
+                    &skill.version,
+                    &features,
+                    classification.as_str(),
+                    confidence,
+                    receipt.as_ref().map(|r| r.receipt_id.as_str()).unwrap_or("n/a"),
+                );
+                println!("Risk Factors:");
+                for factor in &flagged.primary_risk_factors {
+                    println!("  - {}", factor);
+                }
+                println!();
+            }
+
+            if let Some(ref r) = receipt {
+                println!("Receipt ID: {}", r.receipt_id);
+            }
+            println!("Model Hash: {}", model_hash);
+        }
+    }
+
+    // Save receipt if output specified
+    if let (Some(output_path), Some(ref r)) = (output, &receipt) {
+        fs::write(&output_path, serde_json::to_string_pretty(r)?)?;
+        eprintln!("Receipt saved to: {}", output_path.display());
+    }
+
+    // Exit code: 1 for DANGEROUS/MALICIOUS, 0 otherwise
+    if classification.is_deny() {
+        Ok(1)
+    } else {
+        Ok(0)
+    }
+}
+
+/// Compute softmax scores from raw classifier output
+fn compute_scores(feature_vec: &[i32]) -> Result<ClassScores> {
+    use onnx_tracer::tensor::Tensor;
+
+    let model = clawguard::models::skill_safety::skill_safety_model();
+    let input = Tensor::new(Some(feature_vec), &[1, 22])
+        .map_err(|e| eyre::eyre!("Tensor error: {:?}", e))?;
+
+    let result = model
+        .forward(std::slice::from_ref(&input))
+        .map_err(|e| eyre::eyre!("Forward error: {}", e))?;
+
+    let data = &result.outputs[0].inner;
+    let raw_scores: [i32; 4] = [
+        data.get(0).copied().unwrap_or(0),
+        data.get(1).copied().unwrap_or(0),
+        data.get(2).copied().unwrap_or(0),
+        data.get(3).copied().unwrap_or(0),
+    ];
+
+    Ok(ClassScores::from_raw_scores(&raw_scores))
+}
+
+fn cmd_serve(bind: String, max_proofs: usize, require_proof: bool, rate_limit: u32) -> Result<()> {
+    use clawguard::server::{run_server, ServerConfig};
+
+    let bind_addr = bind.parse()
+        .wrap_err_with(|| format!("Invalid bind address: {}", bind))?;
+
+    let config = ServerConfig {
+        bind_addr,
+        max_concurrent_proofs: max_proofs,
+        require_proof,
+        guards_config: load_config(),
+        rate_limit_rpm: rate_limit,
+    };
+
+    eprintln!("Starting ClawGuard prover service...");
+    eprintln!("Model: skill-safety (1,924 params)");
+    eprintln!("Max concurrent proofs: {}", max_proofs);
+
+    // Run the async server
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run_server(config))?;
+
+    Ok(())
+}
+
+fn cmd_verify_receipt(
+    input: PathBuf,
+    skill_path: Option<PathBuf>,
+    verify_proof: bool,
+) -> Result<()> {
+    use clawguard::receipt::RECEIPT_VERSION;
+
+    // Load the receipt
+    let content = fs::read_to_string(&input)
+        .wrap_err_with(|| format!("Failed to read receipt: {}", input.display()))?;
+    let receipt: GuardrailReceipt = serde_json::from_str(&content)
+        .wrap_err("Failed to parse receipt JSON")?;
+
+    let mut warnings = Vec::new();
+    let mut errors = Vec::new();
+
+    // Check 1: Schema version
+    let schema_valid = receipt.version == RECEIPT_VERSION;
+    if !schema_valid {
+        warnings.push(format!(
+            "Schema version mismatch: got {}, expected {}",
+            receipt.version, RECEIPT_VERSION
+        ));
+    }
+
+    // Check 2: Nonce format (should be 64 hex chars = 32 bytes)
+    let nonce_valid = receipt.nonce.len() == 64
+        && receipt.nonce.chars().all(|c| c.is_ascii_hexdigit());
+    if !nonce_valid {
+        errors.push(format!(
+            "Invalid nonce format: expected 64 hex chars, got {} chars",
+            receipt.nonce.len()
+        ));
+    }
+
+    // Check 3: Model hash matches known models
+    let known_model_hashes = get_known_model_hashes();
+    let model_known = known_model_hashes.contains(&receipt.guardrail.model_hash);
+    if !model_known {
+        warnings.push(format!(
+            "Model hash not in known registry: {}",
+            receipt.guardrail.model_hash
+        ));
+    }
+
+    // Check 4: Commitment format
+    let commitment_valid = receipt.subject.commitment.starts_with("sha256:")
+        && receipt.subject.commitment.len() == 71; // "sha256:" + 64 hex
+    if !commitment_valid {
+        errors.push("Invalid commitment format".to_string());
+    }
+
+    // Check 5: Commitment matches skill (if provided)
+    let commitment_matches = if let Some(skill_path) = skill_path {
+        let skill: Skill = if skill_path.extension().map(|e| e == "json").unwrap_or(false) {
+            let content = fs::read_to_string(&skill_path)?;
+            serde_json::from_str(&content)?
+        } else {
+            skill_from_skill_md(&skill_path)?
+        };
+        let features = SkillFeatures::extract(&skill, None);
+        let matches = receipt.verify_commitment(&features);
+        if !matches {
+            errors.push("Input commitment does not match provided skill".to_string());
+        }
+        Some(matches)
+    } else {
+        None
+    };
+
+    // Check 6: Decision consistency
+    let decision_consistent = match receipt.evaluation.classification.as_str() {
+        "SAFE" | "CAUTION" => receipt.evaluation.decision == "allow",
+        "DANGEROUS" | "MALICIOUS" => receipt.evaluation.decision == "deny",
+        _ => {
+            warnings.push(format!(
+                "Unknown classification: {}",
+                receipt.evaluation.classification
+            ));
+            true // Can't verify unknown classifications
+        }
+    };
+    if !decision_consistent {
+        errors.push(format!(
+            "Decision '{}' inconsistent with classification '{}'",
+            receipt.evaluation.decision, receipt.evaluation.classification
+        ));
+    }
+
+    // Check 7: ZK proof verification (if requested and proof exists)
+    let proof_valid = if verify_proof && !receipt.proof.proof_bytes.is_empty() {
+        // Try to verify the proof
+        match verify_receipt_proof(&receipt) {
+            Ok(valid) => {
+                if !valid {
+                    errors.push("ZK proof verification failed".to_string());
+                }
+                Some(valid)
+            }
+            Err(e) => {
+                errors.push(format!("ZK proof verification error: {}", e));
+                Some(false)
+            }
+        }
+    } else if verify_proof && receipt.proof.proof_bytes.is_empty() {
+        warnings.push("No proof bytes in receipt to verify".to_string());
+        None
+    } else {
+        None
+    };
+
+    // Overall validity
+    let valid = errors.is_empty() && schema_valid && nonce_valid && commitment_valid && decision_consistent;
+
+    let result = ReceiptVerifyResult {
+        valid,
+        receipt_id: receipt.receipt_id.clone(),
+        checks: ReceiptChecks {
+            schema_valid,
+            nonce_valid,
+            model_known,
+            model_hash: receipt.guardrail.model_hash.clone(),
+            commitment_valid,
+            commitment_matches,
+            decision_consistent,
+            proof_valid,
+            classification: receipt.evaluation.classification.clone(),
+            decision: receipt.evaluation.decision.clone(),
+            confidence: receipt.evaluation.confidence,
+        },
+        warnings,
+        errors,
+    };
+
+    println!("{}", serde_json::to_string_pretty(&result)?);
+
+    // Also print human-readable summary
+    eprintln!();
+    if result.valid {
+        eprintln!("✅ Receipt verification PASSED");
+        eprintln!("   Receipt ID: {}", receipt.receipt_id);
+        eprintln!("   Subject: {}", receipt.subject.description);
+        eprintln!("   Classification: {} ({})",
+            receipt.evaluation.classification,
+            receipt.evaluation.decision
+        );
+        eprintln!("   Confidence: {:.1}%", receipt.evaluation.confidence * 100.0);
+    } else {
+        eprintln!("❌ Receipt verification FAILED");
+        for err in &result.errors {
+            eprintln!("   Error: {}", err);
+        }
+    }
+    if !result.warnings.is_empty() {
+        eprintln!();
+        for warn in &result.warnings {
+            eprintln!("   ⚠️  {}", warn);
+        }
+    }
+
+    Ok(())
+}
+
+/// Get known model hashes for verification
+fn get_known_model_hashes() -> Vec<String> {
+    use clawguard::hash_model_fn;
+    use clawguard::models::skill_safety::skill_safety_model;
+    use clawguard::models::action_gatekeeper::action_gatekeeper_model;
+    use clawguard::models::pii_shield::pii_shield_model;
+    use clawguard::models::scope_guard::scope_guard_model;
+
+    vec![
+        hash_model_fn(skill_safety_model),
+        hash_model_fn(action_gatekeeper_model),
+        hash_model_fn(pii_shield_model),
+        hash_model_fn(scope_guard_model),
+    ]
+}
+
+/// Verify the ZK proof in a receipt
+fn verify_receipt_proof(receipt: &GuardrailReceipt) -> Result<bool> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    use clawguard::models::skill_safety::skill_safety_model;
+    use onnx_tracer::ProgramIO;
+
+    // For now, we only support verifying skill-safety proofs
+    if receipt.guardrail.domain != "safety" {
+        eyre::bail!("Only safety domain proofs are supported for verification");
+    }
+
+    // Verify model hash matches
+    let expected_hash = clawguard::hash_model_fn(skill_safety_model);
+    if receipt.guardrail.model_hash != expected_hash {
+        return Ok(false);
+    }
+
+    // Check that proof bytes exist
+    if receipt.proof.proof_bytes.is_empty() {
+        return Ok(false);
+    }
+
+    // Check if we have program_io for full verification
+    let program_io_str = match &receipt.proof.program_io {
+        Some(s) => s,
+        None => {
+            // Without program_io, we can only verify model hash and proof existence
+            // This is a partial verification
+            eprintln!("WARNING: Receipt missing program_io, performing partial verification");
+            return Ok(true);
+        }
+    };
+
+    // Decode proof bytes from base64
+    let proof_bytes = B64.decode(&receipt.proof.proof_bytes)
+        .wrap_err("Failed to decode proof bytes from base64")?;
+
+    // Parse program IO
+    let program_io: ProgramIO = serde_json::from_str(program_io_str)
+        .wrap_err("Failed to parse program_io")?;
+
+    // Perform full proof verification
+    let max_trace_length = 1 << 16; // Same as skill-safety model
+    clawguard::proving::verify_proof_from_bytes(
+        &proof_bytes,
+        skill_safety_model,
+        program_io,
+        max_trace_length,
+    )
+}
+
+fn cmd_migrate_proofs(
+    proof_dir_override: Option<PathBuf>,
+    dry_run: bool,
+    archive: bool,
+) -> Result<()> {
+    use clawguard::models::skill_safety::skill_safety_model;
+
+    let config = load_config();
+    let proof_directory = proof_dir_override.unwrap_or_else(|| clawguard::proof_dir(config.as_ref()));
+    let current_model_hash = clawguard::hash_model_fn(skill_safety_model);
+
+    println!("Proof directory: {}", proof_directory.display());
+    println!("Current model hash: {}", current_model_hash);
+    println!();
+
+    if !proof_directory.exists() {
+        println!("Proof directory does not exist. Nothing to migrate.");
+        return Ok(());
+    }
+
+    if archive {
+        println!("{}archiving old proofs...", if dry_run { "[DRY RUN] " } else { "" });
+        let results = clawguard::migration::archive_old_proofs(
+            &proof_directory,
+            &current_model_hash,
+            dry_run,
+        )?;
+
+        if results.is_empty() {
+            println!("No proofs need archiving.");
+        } else {
+            for result in &results {
+                println!(
+                    "  {} -> {}",
+                    result.proof_path,
+                    result.new_path.as_deref().unwrap_or("(error)")
+                );
+                if let Some(ref err) = result.error {
+                    println!("    Error: {}", err);
+                }
+            }
+            let archived_count = results.iter().filter(|r| r.migrated).count();
+            let would_archive = results.iter().filter(|r| r.status == "would_archive").count();
+            if dry_run {
+                println!("\n{} proofs would be archived.", would_archive);
+            } else {
+                println!("\n{} proofs archived.", archived_count);
+            }
+        }
+    } else {
+        println!("Scanning proofs for migration status...");
+        let results = clawguard::migration::scan_proofs_for_migration(
+            &proof_directory,
+            &current_model_hash,
+        )?;
+
+        if results.is_empty() {
+            println!("No proof files found.");
+        } else {
+            let mut needs_migration = 0;
+            let mut current = 0;
+            let mut other = 0;
+
+            for result in &results {
+                let status_display = if result.status.starts_with("needs_migration") {
+                    needs_migration += 1;
+                    "⚠️  NEEDS MIGRATION"
+                } else if result.status == "current" {
+                    current += 1;
+                    "✅ current"
+                } else {
+                    other += 1;
+                    &result.status
+                };
+                println!("  {} - {}", result.proof_path, status_display);
+            }
+
+            println!();
+            println!("Summary: {} current, {} need migration, {} other", current, needs_migration, other);
+
+            if needs_migration > 0 {
+                println!();
+                println!("To archive old proofs, run: clawguard migrate-proofs --archive");
+                println!("To preview without changes: clawguard migrate-proofs --archive --dry-run");
+            }
+        }
     }
 
     Ok(())
@@ -340,7 +1017,50 @@ fn main() {
         } => cmd_verify(proof, model_hash, model_name),
         Commands::History { limit } => cmd_history(limit),
         Commands::Models => cmd_models(),
-        Commands::ConfigCheck => cmd_config_check(),
+        Commands::ConfigCheck { ignore_config_errors } => {
+            match cmd_config_check(ignore_config_errors) {
+                Ok(code) => {
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::ScanSkill {
+            input,
+            vt_report,
+            prove,
+            format,
+            output,
+        } => {
+            match cmd_scan_skill(input, vt_report, prove, format, output) {
+                Ok(code) => {
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Serve {
+            bind,
+            max_proofs,
+            require_proof,
+            rate_limit,
+        } => cmd_serve(bind, max_proofs, require_proof, rate_limit),
+        Commands::VerifyReceipt {
+            input,
+            skill,
+            verify_proof,
+        } => cmd_verify_receipt(input, skill, verify_proof),
+        Commands::MigrateProofs {
+            proof_dir,
+            dry_run,
+            archive,
+        } => cmd_migrate_proofs(proof_dir, dry_run, archive),
     };
 
     if let Err(e) = result {

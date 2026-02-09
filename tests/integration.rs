@@ -339,7 +339,8 @@ fn test_validate_config_bad_enforcement() {
     };
     let issues = clawguard::validate_config(&config);
     assert!(!issues.is_empty(), "Bad enforcement should produce issues");
-    assert!(issues[0].contains("unknown enforcement level"));
+    assert!(issues[0].message.contains("unknown enforcement level"));
+    assert!(issues[0].is_error(), "Invalid enforcement should be an error");
 }
 
 // ---------------------------------------------------------------------------
@@ -395,4 +396,167 @@ fn test_history_rotation() {
     assert_eq!(lines.len(), 50, "Should keep half the entries");
 
     let _ = fs::remove_dir_all(&tmp);
+}
+
+// ---------------------------------------------------------------------------
+// Encoding edge case tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_encode_action_empty_context() {
+    // Empty JSON object should not panic
+    let features = clawguard::encoding::encode_action("run_command", "{}");
+    assert_eq!(features.len(), 8);
+    assert_eq!(features[0], 128, "run_command should be set");
+    assert_eq!(features[5], 0, "no sudo");
+}
+
+#[test]
+fn test_encode_action_invalid_json() {
+    // Invalid JSON should log warning but not panic
+    let features = clawguard::encoding::encode_action("run_command", "not valid json");
+    assert_eq!(features.len(), 8);
+    // Should return zeros for all features due to parse failure
+}
+
+#[test]
+fn test_encode_pii_unicode() {
+    // Unicode text should be handled without panic
+    let features = clawguard::encoding::encode_pii("Ünïcödé tëxt with émojis 🎉");
+    assert_eq!(features.len(), 8);
+    assert_eq!(features[0], 0, "No SSN");
+    assert_eq!(features[1], 0, "No email");
+}
+
+#[test]
+fn test_encode_pii_very_long() {
+    // Very long text should not cause issues
+    let long_text = "a".repeat(100_000);
+    let features = clawguard::encoding::encode_pii(&long_text);
+    assert_eq!(features.len(), 8);
+    assert_eq!(features[7], 128, "Long text should be in bucket 128");
+}
+
+#[test]
+fn test_encode_action_null_bytes() {
+    // Text with null bytes should be handled
+    let context = r#"{"command": "echo\x00test"}"#;
+    let features = clawguard::encoding::encode_action("run_command", context);
+    assert_eq!(features.len(), 8);
+}
+
+#[test]
+fn test_encode_scope_empty_path() {
+    let features = clawguard::encoding::encode_scope("read_file", r#"{"path": ""}"#);
+    assert_eq!(features.len(), 8);
+    assert_eq!(features[0], 0, "Empty path not in workspace");
+}
+
+#[test]
+fn test_encode_scope_very_deep_path() {
+    let deep_path = format!("{}/file.txt", "a/".repeat(50));
+    let context = format!(r#"{{"path": "{}"}}"#, deep_path);
+    let features = clawguard::encoding::encode_scope("read_file", &context);
+    assert_eq!(features.len(), 8);
+    assert_eq!(features[2], 128, "Very deep path should max out depth");
+}
+
+// ---------------------------------------------------------------------------
+// Model name matching tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_model_name_exact_match() {
+    use clawguard::GuardModel;
+
+    // Test exact matches work
+    assert!(GuardModel::from_name("action-gatekeeper").is_ok());
+    assert!(GuardModel::from_name("pii-shield").is_ok());
+    assert!(GuardModel::from_name("scope-guard").is_ok());
+    assert!(GuardModel::from_name("skill-safety").is_ok());
+
+    // Test underscore variants
+    assert!(GuardModel::from_name("action_gatekeeper").is_ok());
+    assert!(GuardModel::from_name("pii_shield").is_ok());
+
+    // Test unknown names fail
+    assert!(GuardModel::from_name("unknown").is_err());
+    assert!(GuardModel::from_name("action").is_err()); // Partial match should fail
+    assert!(GuardModel::from_name("gatekeeper").is_err()); // Partial match should fail
+}
+
+// ---------------------------------------------------------------------------
+// Config validation tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_config_has_errors_function() {
+    use clawguard::{ConfigIssue, config_has_errors};
+
+    let no_issues: Vec<ConfigIssue> = vec![];
+    assert!(!config_has_errors(&no_issues));
+
+    let warnings_only = vec![ConfigIssue::warning("test warning")];
+    assert!(!config_has_errors(&warnings_only));
+
+    let with_errors = vec![
+        ConfigIssue::warning("test warning"),
+        ConfigIssue::error("test error"),
+    ];
+    assert!(config_has_errors(&with_errors));
+}
+
+// ---------------------------------------------------------------------------
+// Deny decision tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_is_deny_decision_comprehensive() {
+    // All deny labels
+    assert!(clawguard::is_deny_decision("DENIED"));
+    assert!(clawguard::is_deny_decision("PII_DETECTED"));
+    assert!(clawguard::is_deny_decision("OUT_OF_SCOPE"));
+    assert!(clawguard::is_deny_decision("BLOCK"));
+    assert!(clawguard::is_deny_decision("DANGEROUS"));
+    assert!(clawguard::is_deny_decision("MALICIOUS"));
+
+    // All allow labels
+    assert!(!clawguard::is_deny_decision("APPROVED"));
+    assert!(!clawguard::is_deny_decision("CLEAN"));
+    assert!(!clawguard::is_deny_decision("IN_SCOPE"));
+    assert!(!clawguard::is_deny_decision("SAFE"));
+    assert!(!clawguard::is_deny_decision("CAUTION"));
+
+    // Unknown labels
+    assert!(!clawguard::is_deny_decision("UNKNOWN"));
+    assert!(!clawguard::is_deny_decision(""));
+}
+
+// ---------------------------------------------------------------------------
+// Encode with deny_on_error tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_encode_action_or_default_deny_mode() {
+    // Invalid JSON with deny_on_error=true should return deny-safe defaults
+    let features = clawguard::encoding::encode_action_or_default(
+        "run_command",
+        "not valid json",
+        true, // deny_on_error
+    );
+    assert_eq!(features.len(), 8);
+    assert_eq!(features[5], 128, "has_sudo should be set for deny-safe");
+    assert_eq!(features[7], 128, "has_pipe should be set for deny-safe");
+}
+
+#[test]
+fn test_encode_scope_or_default_deny_mode() {
+    let features = clawguard::encoding::encode_scope_or_default(
+        "read_file",
+        "invalid json",
+        true, // deny_on_error
+    );
+    assert_eq!(features.len(), 8);
+    assert_eq!(features[1], 128, "has_dotdot should be set for deny-safe");
+    assert_eq!(features[3], 128, "targets_system_dir should be set for deny-safe");
 }

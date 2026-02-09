@@ -87,6 +87,27 @@ pub fn prove_and_save(
     Ok((path, program_io))
 }
 
+/// Verify a proof from raw bytes and program IO.
+///
+/// This is used for verifying proofs embedded in receipts.
+pub fn verify_proof_from_bytes(
+    proof_bytes: &[u8],
+    model_fn: fn() -> Model,
+    program_io: ProgramIO,
+    max_trace_length: usize,
+) -> Result<bool> {
+    let snark = Snark::deserialize_compressed(proof_bytes)
+        .map_err(|e| eyre::eyre!("failed to deserialize proof: {}", e))?;
+
+    let preprocessing = Snark::prover_preprocess(model_fn, max_trace_length);
+    let verifier_preprocessing = (&preprocessing).into();
+
+    match snark.verify(&verifier_preprocessing, program_io, None) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
 /// Verify a proof from a saved JSON file.
 ///
 /// Fails if `expected_model_hash` does not match the hash stored in the proof file

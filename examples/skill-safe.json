@@ -1,0 +1,17 @@
+{
+  "name": "weather-helper",
+  "version": "1.0.0",
+  "author": "trusted-dev",
+  "description": "A simple skill that fetches weather data",
+  "skill_md": "# Weather Helper\n\nThis skill fetches weather information for a given location.\n\n## Usage\n\nAsk: \"What's the weather in San Francisco?\"\n\n## Capabilities\n\n- Fetches current weather data\n- Supports cities worldwide\n\n## Requirements\n\n- Internet connection\n- No API key required (uses free weather API)",
+  "scripts": [],
+  "metadata": {
+    "stars": 250,
+    "downloads": 5000,
+    "created_at": "2025-06-15T00:00:00Z",
+    "updated_at": "2026-01-10T00:00:00Z",
+    "author_account_created": "2024-03-01T00:00:00Z",
+    "author_total_skills": 12
+  },
+  "files": ["SKILL.md"]
+}

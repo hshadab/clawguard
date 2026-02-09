@@ -1,33 +1,16 @@
 //! Feature encoding for guardrail model inputs.
 //! Converts action/context strings into fixed-size i32 vectors scaled for the MLP.
 
-use regex::Regex;
-use std::sync::LazyLock;
-
 use crate::action::ActionType;
+use crate::patterns::{CC_RE, EMAIL_RE, PHONE_RE, SSN_RE};
 use crate::rules::CompiledPolicy;
+use eyre::{Result, WrapErr};
 
 const SCALE_MULTIPLIER: i32 = 128; // 2^7, matching scale=7
 
 // ---------------------------------------------------------------------------
-// Pre-compiled regexes (avoid recompiling on every call)
+// Error-handling encoding functions (return Result)
 // ---------------------------------------------------------------------------
-
-static SSN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap());
-
-static EMAIL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap());
-
-// Note: The phone regex (\b\d{3}[-.]?\d{3}[-.]?\d{4}\b) can in theory match a
-// bare 10-digit substring of an SSN-like string. In practice SSNs contain
-// hyphens after groups of 3-2-4 digits which prevents the phone pattern from
-// matching, so the overlap is benign for realistic inputs.
-static PHONE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b").unwrap());
-
-static CC_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b").unwrap());
 
 /// Encode an action + context into an [1,8] feature vector for action-gatekeeper.
 ///
@@ -36,14 +19,12 @@ static CC_RE: LazyLock<Regex> =
 /// 5: has_sudo
 /// 6: targets_dotfile
 /// 7: has_pipe_redirect
-pub fn encode_action(action: &str, context: &str) -> Vec<i32> {
-    let ctx: serde_json::Value = match serde_json::from_str(context) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("WARNING: encode_action: failed to parse context JSON: {}", e);
-            serde_json::Value::default()
-        }
-    };
+///
+/// Returns an error if context JSON parsing fails.
+pub fn encode_action_checked(action: &str, context: &str) -> Result<Vec<i32>> {
+    let ctx: serde_json::Value = serde_json::from_str(context)
+        .wrap_err_with(|| format!("encode_action: failed to parse context JSON"))?;
+
     let command = ctx
         .get("command")
         .and_then(|v| v.as_str())
@@ -56,8 +37,6 @@ pub fn encode_action(action: &str, context: &str) -> Vec<i32> {
     // One-hot action type via ActionType enum
     if let Some(at) = ActionType::from_str_opt(action) {
         features[at.one_hot_index()] = SCALE_MULTIPLIER;
-    } else {
-        eprintln!("WARNING: encode_action: unknown action type '{}'", action);
     }
 
     // Binary features from context
@@ -71,7 +50,7 @@ pub fn encode_action(action: &str, context: &str) -> Vec<i32> {
         features[7] = SCALE_MULTIPLIER;
     }
 
-    features
+    Ok(features)
 }
 
 /// Encode text into an [1,8] feature vector for pii-shield.
@@ -85,7 +64,9 @@ pub fn encode_action(action: &str, context: &str) -> Vec<i32> {
 /// 5: secret/token keyword flag
 /// 6: digit density (scaled)
 /// 7: text length bucket
-pub fn encode_pii(text: &str) -> Vec<i32> {
+///
+/// This function always succeeds for text input.
+pub fn encode_pii_checked(text: &str) -> Result<Vec<i32>> {
     let mut features = vec![0i32; 8];
 
     features[0] = (SSN_RE.find_iter(text).count() as i32).min(1) * SCALE_MULTIPLIER;
@@ -118,7 +99,7 @@ pub fn encode_pii(text: &str) -> Vec<i32> {
         _ => SCALE_MULTIPLIER,
     };
 
-    features
+    Ok(features)
 }
 
 /// Encode action + context into an [1,8] feature vector for scope-guard.
@@ -132,14 +113,12 @@ pub fn encode_pii(text: &str) -> Vec<i32> {
 /// 5: targets_sensitive_dotfile
 /// 6: is_absolute
 /// 7: path_length_bucket
-pub fn encode_scope(_action: &str, context: &str) -> Vec<i32> {
-    let ctx: serde_json::Value = match serde_json::from_str(context) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("WARNING: encode_scope: failed to parse context JSON: {}", e);
-            serde_json::Value::default()
-        }
-    };
+///
+/// Returns an error if context JSON parsing fails.
+pub fn encode_scope_checked(_action: &str, context: &str) -> Result<Vec<i32>> {
+    let ctx: serde_json::Value = serde_json::from_str(context)
+        .wrap_err_with(|| format!("encode_scope: failed to parse context JSON"))?;
+
     let path = ctx
         .get("path")
         .or_else(|| ctx.get("command"))
@@ -197,7 +176,104 @@ pub fn encode_scope(_action: &str, context: &str) -> Vec<i32> {
         _ => SCALE_MULTIPLIER,
     };
 
+    Ok(features)
+}
+
+// ---------------------------------------------------------------------------
+// Fallback wrappers (legacy API - use deny-safe defaults on error)
+// ---------------------------------------------------------------------------
+
+/// Default feature vector for action encoding (deny-safe: sudo + pipe flags set)
+fn deny_safe_action_features() -> Vec<i32> {
+    let mut features = vec![0i32; 8];
+    features[5] = SCALE_MULTIPLIER; // has_sudo
+    features[7] = SCALE_MULTIPLIER; // has_pipe_redirect
     features
+}
+
+/// Default feature vector for PII encoding (deny-safe: flag all PII types)
+fn deny_safe_pii_features() -> Vec<i32> {
+    let mut features = vec![0i32; 8];
+    features[0] = SCALE_MULTIPLIER; // SSN
+    features[4] = SCALE_MULTIPLIER; // password keyword
+    features[5] = SCALE_MULTIPLIER; // secret/token
+    features
+}
+
+/// Default feature vector for scope encoding (deny-safe: system dir + absolute)
+fn deny_safe_scope_features() -> Vec<i32> {
+    let mut features = vec![0i32; 8];
+    features[1] = SCALE_MULTIPLIER; // has_dotdot
+    features[3] = SCALE_MULTIPLIER; // targets_system_dir
+    features[6] = SCALE_MULTIPLIER; // is_absolute
+    features
+}
+
+/// Encode action with fallback on error. If `deny_on_error` is true, returns
+/// deny-safe defaults; otherwise returns all-zeros.
+pub fn encode_action_or_default(action: &str, context: &str, deny_on_error: bool) -> Vec<i32> {
+    match encode_action_checked(action, context) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("WARNING: encode_action: {}", e);
+            if deny_on_error {
+                deny_safe_action_features()
+            } else {
+                vec![0i32; 8]
+            }
+        }
+    }
+}
+
+/// Encode PII with fallback on error.
+pub fn encode_pii_or_default(text: &str, deny_on_error: bool) -> Vec<i32> {
+    match encode_pii_checked(text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("WARNING: encode_pii: {}", e);
+            if deny_on_error {
+                deny_safe_pii_features()
+            } else {
+                vec![0i32; 8]
+            }
+        }
+    }
+}
+
+/// Encode scope with fallback on error.
+pub fn encode_scope_or_default(action: &str, context: &str, deny_on_error: bool) -> Vec<i32> {
+    match encode_scope_checked(action, context) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("WARNING: encode_scope: {}", e);
+            if deny_on_error {
+                deny_safe_scope_features()
+            } else {
+                vec![0i32; 8]
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy API (backward compatible - always succeeds with warnings)
+// ---------------------------------------------------------------------------
+
+/// Legacy encode_action that never fails (logs warnings on parse errors).
+/// Use `encode_action_checked` for explicit error handling.
+pub fn encode_action(action: &str, context: &str) -> Vec<i32> {
+    encode_action_or_default(action, context, false)
+}
+
+/// Legacy encode_pii that never fails.
+pub fn encode_pii(text: &str) -> Vec<i32> {
+    encode_pii_or_default(text, false)
+}
+
+/// Legacy encode_scope that never fails (logs warnings on parse errors).
+/// Use `encode_scope_checked` for explicit error handling.
+pub fn encode_scope(action: &str, context: &str) -> Vec<i32> {
+    encode_scope_or_default(action, context, false)
 }
 
 /// Encode action + context into a feature vector for a compiled policy model.
@@ -211,6 +287,16 @@ pub fn encode_policy(
     policy: Option<&CompiledPolicy>,
     input_width: usize,
 ) -> Vec<i32> {
+    encode_policy_or_default(action, context, policy, input_width, false)
+}
+
+/// Encode policy with explicit error handling.
+pub fn encode_policy_checked(
+    action: &str,
+    context: &str,
+    policy: Option<&CompiledPolicy>,
+    input_width: usize,
+) -> Result<Vec<i32>> {
     let mut features = vec![0i32; input_width];
 
     // One-hot action type (slots 0-4) via ActionType enum
@@ -220,13 +306,9 @@ pub fn encode_policy(
 
     // Condition slots
     if let Some(policy) = policy {
-        let ctx: serde_json::Value = match serde_json::from_str(context) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("WARNING: encode_policy: failed to parse context JSON: {}", e);
-                serde_json::Value::default()
-            }
-        };
+        let ctx: serde_json::Value = serde_json::from_str(context)
+            .wrap_err_with(|| format!("encode_policy: failed to parse context JSON"))?;
+
         let url = ctx.get("url").and_then(|v| v.as_str()).unwrap_or("");
         let path = ctx.get("path").and_then(|v| v.as_str()).unwrap_or("");
         let command = ctx.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -263,5 +345,31 @@ pub fn encode_policy(
         }
     }
 
-    features
+    Ok(features)
+}
+
+/// Encode policy with fallback on error.
+pub fn encode_policy_or_default(
+    action: &str,
+    context: &str,
+    policy: Option<&CompiledPolicy>,
+    input_width: usize,
+    deny_on_error: bool,
+) -> Vec<i32> {
+    match encode_policy_checked(action, context, policy, input_width) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("WARNING: encode_policy: {}", e);
+            if deny_on_error {
+                // Deny-safe: set all condition slots to trigger block rules
+                let mut features = vec![0i32; input_width];
+                for i in 5..input_width {
+                    features[i] = SCALE_MULTIPLIER;
+                }
+                features
+            } else {
+                vec![0i32; input_width]
+            }
+        }
+    }
 }
