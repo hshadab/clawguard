@@ -10,7 +10,10 @@ use clawguard::{
     enforcement::EnforcementLevel,
     history_path, is_deny_decision, load_config, rotate_history_if_needed, run_guardrail,
     run_skill_safety, validate_config, config_has_errors, GuardModel,
-    receipt::{FlaggedSkill, GuardrailReceipt, ClassScores, generate_nonce},
+    receipt::{
+        CrossReferenceData, FlaggedSkill, GuardrailReceipt, ClassScores, PaymentInfo,
+        ScanResult, generate_nonce,
+    },
     skill::{Skill, SkillFeatures, VTReport, derive_decision, skill_from_skill_md},
 };
 
@@ -102,6 +105,41 @@ enum Commands {
         /// Save receipt to file
         #[arg(long)]
         output: Option<PathBuf>,
+
+        /// Optional x402 payment JSON
+        #[arg(long)]
+        payment_json: Option<String>,
+    },
+
+    /// Batch-scan multiple skills for safety issues
+    ScanBatch {
+        /// Directory of *.json skill files
+        #[arg(long)]
+        input_dir: Option<PathBuf>,
+
+        /// JSON array of file paths to scan
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Output directory for receipts and flagged files
+        #[arg(long, default_value = ".")]
+        output_dir: PathBuf,
+
+        /// Delay between scans in milliseconds
+        #[arg(long, default_value_t = 0)]
+        delay_ms: u64,
+
+        /// Generate zero-knowledge proofs
+        #[arg(long, default_value_t = false)]
+        prove: bool,
+
+        /// Log progress every N skills
+        #[arg(long, default_value_t = 10)]
+        progress_every: usize,
+
+        /// Optional x402 payment JSON
+        #[arg(long)]
+        payment_json: Option<String>,
     },
 
     /// Start the HTTP prover service
@@ -454,6 +492,7 @@ fn cmd_scan_skill(
     prove: bool,
     format: String,
     output: Option<PathBuf>,
+    payment_json: Option<String>,
 ) -> Result<i32> {
     let config = load_config();
 
@@ -499,7 +538,7 @@ fn cmd_scan_skill(
             (String::new(), None)
         };
 
-        Some(GuardrailReceipt::new_safety_receipt(
+        let mut r = GuardrailReceipt::new_safety_receipt(
             &skill.name,
             &skill.version,
             &features,
@@ -514,7 +553,16 @@ fn cmd_scan_skill(
             None,
             program_io,
             generate_nonce(),
-        ))
+        );
+
+        // Attach payment if provided
+        if let Some(ref pj) = payment_json {
+            let pay: PaymentInfo = serde_json::from_str(pj)
+                .wrap_err("Failed to parse payment JSON")?;
+            r = r.with_payment(pay);
+        }
+
+        Some(r)
     } else {
         None
     };
@@ -570,6 +618,7 @@ fn cmd_scan_skill(
                     classification.as_str(),
                     confidence,
                     receipt.as_ref().map(|r| r.receipt_id.as_str()).unwrap_or("n/a"),
+                    None,
                 );
                 println!("Risk Factors:");
                 for factor in &flagged.primary_risk_factors {
@@ -593,6 +642,218 @@ fn cmd_scan_skill(
 
     // Exit code: 1 for DANGEROUS/MALICIOUS, 0 otherwise
     if classification.is_deny() {
+        Ok(1)
+    } else {
+        Ok(0)
+    }
+}
+
+fn cmd_scan_batch(
+    input_dir: Option<PathBuf>,
+    manifest: Option<PathBuf>,
+    output_dir: PathBuf,
+    delay_ms: u64,
+    prove: bool,
+    progress_every: usize,
+    payment_json: Option<String>,
+) -> Result<i32> {
+    let config = load_config();
+
+    // Collect skill file paths
+    let skill_paths: Vec<PathBuf> = if let Some(ref dir) = input_dir {
+        let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+            .wrap_err_with(|| format!("Cannot read input directory: {}", dir.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+            .collect();
+        paths.sort();
+        paths
+    } else if let Some(ref manifest_path) = manifest {
+        let content = fs::read_to_string(manifest_path)
+            .wrap_err("Failed to read manifest file")?;
+        let paths: Vec<String> = serde_json::from_str(&content)
+            .wrap_err("Manifest must be a JSON array of file paths")?;
+        paths.into_iter().map(PathBuf::from).collect()
+    } else {
+        eyre::bail!("Either --input-dir or --manifest must be specified");
+    };
+
+    if skill_paths.is_empty() {
+        eprintln!("No skill files found.");
+        return Ok(0);
+    }
+
+    eprintln!("Found {} skill files to scan", skill_paths.len());
+
+    // Create output directories
+    let receipts_dir = output_dir.join("receipts").join("safety");
+    let flagged_dir = output_dir.join("flagged").join("safety");
+    fs::create_dir_all(&receipts_dir)?;
+    fs::create_dir_all(&flagged_dir)?;
+
+    // Load cross-reference data if data/ directory exists
+    let data_dir = std::path::Path::new("data");
+    let cross_ref = if data_dir.is_dir() {
+        Some(CrossReferenceData::load(data_dir))
+    } else {
+        None
+    };
+
+    // Parse payment info once if provided
+    let payment: Option<PaymentInfo> = if let Some(ref pj) = payment_json {
+        Some(serde_json::from_str(pj).wrap_err("Failed to parse payment JSON")?)
+    } else {
+        None
+    };
+
+    // Open JSONL output
+    let jsonl_path = output_dir.join("safety-evaluations.jsonl");
+    let mut jsonl_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&jsonl_path)
+        .wrap_err("Failed to open JSONL output file")?;
+
+    let mut flagged_count = 0;
+    let total = skill_paths.len();
+
+    for (i, path) in skill_paths.iter().enumerate() {
+        // Load skill
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("WARNING: skipping {}: {}", path.display(), e);
+                continue;
+            }
+        };
+        let skill: Skill = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("WARNING: skipping {} (parse error): {}", path.display(), e);
+                continue;
+            }
+        };
+
+        // Extract features and classify
+        let features = SkillFeatures::extract(&skill, None);
+        let (classification, confidence, model_hash, proof_path) =
+            run_skill_safety(&features, prove, config.as_ref())?;
+
+        let feature_vec = features.to_normalized_vec();
+        let scores = compute_scores(&feature_vec)?;
+        let scores_array = [scores.safe, scores.caution, scores.dangerous, scores.malicious];
+        let (decision, reasoning) = derive_decision(classification, &scores_array);
+
+        // Build receipt if proving
+        let receipt = if prove {
+            let (proof_bytes, program_io) = if let Some(ref pp) = proof_path {
+                let pc = fs::read_to_string(pp)?;
+                let json: serde_json::Value = serde_json::from_str(&pc)?;
+                let bytes = json.get("proof").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let io = json.get("program_io").and_then(|v| v.as_str()).map(|s| s.to_string());
+                (bytes, io)
+            } else {
+                (String::new(), None)
+            };
+
+            let mut r = GuardrailReceipt::new_safety_receipt(
+                &skill.name,
+                &skill.version,
+                &features,
+                classification,
+                decision,
+                &reasoning,
+                scores.clone(),
+                confidence,
+                model_hash.clone(),
+                proof_bytes,
+                model_hash.clone(),
+                None,
+                program_io,
+                generate_nonce(),
+            );
+
+            // Attach payment if provided
+            if let Some(ref pay) = payment {
+                r = r.with_payment(pay.clone());
+            }
+
+            Some(r)
+        } else {
+            None
+        };
+
+        let receipt_id = receipt
+            .as_ref()
+            .map(|r| r.receipt_id.clone())
+            .unwrap_or_else(|| "n/a".to_string());
+
+        // Build ScanResult and write JSONL line
+        let scan_result = ScanResult {
+            skill_name: skill.name.clone(),
+            skill_version: skill.version.clone(),
+            skill_uri: format!("clawhub://{}/{}", skill.name, skill.version),
+            scanned_at: chrono::Utc::now(),
+            features: features.clone(),
+            classification: classification.as_str().to_string(),
+            confidence,
+            decision: decision.as_str().to_string(),
+            receipt_id: receipt_id.clone(),
+            receipt_file: if prove {
+                format!("receipts/safety/{}.json", receipt_id)
+            } else {
+                String::new()
+            },
+            payment_tx: payment.as_ref().map(|p| p.tx_hash.clone()),
+            model_hash: model_hash.clone(),
+        };
+
+        let mut line = serde_json::to_string(&scan_result)?;
+        line.push('\n');
+        jsonl_file.write_all(line.as_bytes())?;
+
+        // If DANGEROUS/MALICIOUS: write flagged file
+        if classification.is_deny() {
+            flagged_count += 1;
+            let flagged = FlaggedSkill::from_scan(
+                &skill.name,
+                &skill.version,
+                &features,
+                classification.as_str(),
+                confidence,
+                &receipt_id,
+                cross_ref.as_ref(),
+            );
+            let flagged_path = flagged_dir.join(format!("{}.json", skill.name));
+            fs::write(&flagged_path, serde_json::to_string_pretty(&flagged)?)?;
+        }
+
+        // Write receipt if proving
+        if let Some(ref r) = receipt {
+            let receipt_path = receipts_dir.join(format!("{}.json", r.receipt_id));
+            fs::write(&receipt_path, serde_json::to_string_pretty(r)?)?;
+        }
+
+        // Delay between scans
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+
+        // Progress logging
+        if progress_every > 0 && (i + 1) % progress_every == 0 {
+            eprintln!("[{}/{}] scanned {} — {}", i + 1, total, skill.name, classification.as_str());
+        }
+    }
+
+    // Print summary
+    eprintln!();
+    eprintln!("Batch scan complete:");
+    eprintln!("  Total skills: {}", total);
+    eprintln!("  Flagged: {}", flagged_count);
+    eprintln!("  JSONL output: {}", jsonl_path.display());
+
+    if flagged_count > 0 {
         Ok(1)
     } else {
         Ok(0)
@@ -810,8 +1071,57 @@ fn cmd_verify_receipt(
     Ok(())
 }
 
-/// Get known model hashes for verification
+#[derive(Deserialize)]
+struct ModelRegistry {
+    models: Vec<ModelRegistryEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelRegistryEntry {
+    #[allow(dead_code)]
+    name: String,
+    hash: String,
+    #[allow(dead_code)]
+    version: Option<String>,
+    #[allow(dead_code)]
+    params: Option<u32>,
+    #[allow(dead_code)]
+    architecture: Option<String>,
+    #[allow(dead_code)]
+    trained_at: Option<String>,
+}
+
+/// Get known model hashes for verification.
+///
+/// Tries loading from `data/registry.json` first, then falls back to
+/// computing hashes from model functions.
 fn get_known_model_hashes() -> Vec<String> {
+    // Try loading from data/registry.json
+    let registry_path = std::path::Path::new("data/registry.json");
+    if let Ok(content) = fs::read_to_string(registry_path) {
+        if let Ok(registry) = serde_json::from_str::<ModelRegistry>(&content) {
+            let registry_hashes: Vec<String> = registry
+                .models
+                .iter()
+                .filter(|m| m.hash.starts_with("sha256:"))
+                .map(|m| m.hash.clone())
+                .collect();
+            if !registry_hashes.is_empty() {
+                // Merge with computed hashes to cover all models
+                let mut hashes = registry_hashes;
+                hashes.extend(get_computed_model_hashes());
+                hashes.sort();
+                hashes.dedup();
+                return hashes;
+            }
+        }
+    }
+
+    // Fall back to computing hashes from model functions
+    get_computed_model_hashes()
+}
+
+fn get_computed_model_hashes() -> Vec<String> {
     use clawguard::hash_model_fn;
     use clawguard::models::skill_safety::skill_safety_model;
     use clawguard::models::action_gatekeeper::action_gatekeeper_model;
@@ -1034,8 +1344,28 @@ fn main() {
             prove,
             format,
             output,
+            payment_json,
         } => {
-            match cmd_scan_skill(input, vt_report, prove, format, output) {
+            match cmd_scan_skill(input, vt_report, prove, format, output, payment_json) {
+                Ok(code) => {
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::ScanBatch {
+            input_dir,
+            manifest,
+            output_dir,
+            delay_ms,
+            prove,
+            progress_every,
+            payment_json,
+        } => {
+            match cmd_scan_batch(input_dir, manifest, output_dir, delay_ms, prove, progress_every, payment_json) {
                 Ok(code) => {
                     if code != 0 {
                         std::process::exit(code);

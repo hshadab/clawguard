@@ -1,0 +1,12 @@
+{
+  "models": [
+    {
+      "name": "skill-safety",
+      "hash": "placeholder-run-cargo-test-to-get-hash",
+      "version": "0.1.0",
+      "params": 1924,
+      "architecture": "22x32x32x4 MLP",
+      "trained_at": "2026-02-09T00:00:00Z"
+    }
+  ]
+}

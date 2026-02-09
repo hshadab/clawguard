@@ -26,6 +26,7 @@
 //! ```
 
 pub mod action;
+pub mod clawhub;
 pub mod encoding;
 pub mod enforcement;
 pub mod migration;

@@ -1,0 +1,7 @@
+# Snyk flagged skills — one skill name per line
+# Updated: 2026-02-09
+# Source: Snyk vulnerability database
+#
+# Add skill names (slugs) that have known vulnerabilities per Snyk.
+# Lines starting with # are comments.
+example-malicious-skill

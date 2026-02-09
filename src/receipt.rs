@@ -6,6 +6,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::path::Path;
 
 use crate::skill::{SafetyClassification, SafetyDecision, SkillFeatures};
 
@@ -400,8 +402,54 @@ pub struct CrossReference {
     pub vt_flagged: bool,
 }
 
+/// Cross-reference data loaded from text files in the data/ directory.
+///
+/// Each file contains one skill name per line. Lines starting with `#` are comments.
+pub struct CrossReferenceData {
+    pub koi_flagged: HashSet<String>,
+    pub snyk_flagged: HashSet<String>,
+    pub vt_flagged: HashSet<String>,
+}
+
+impl CrossReferenceData {
+    /// Load cross-reference data from the given directory.
+    /// Reads `koi_flagged.txt`, `snyk_flagged.txt`, `vt_flagged.txt`.
+    /// Missing files are treated as empty sets.
+    pub fn load(data_dir: &Path) -> Self {
+        Self {
+            koi_flagged: Self::load_file(&data_dir.join("koi_flagged.txt")),
+            snyk_flagged: Self::load_file(&data_dir.join("snyk_flagged.txt")),
+            vt_flagged: Self::load_file(&data_dir.join("vt_flagged.txt")),
+        }
+    }
+
+    /// Check a skill name against all cross-reference sources.
+    /// Performs case-insensitive lookup.
+    pub fn check(&self, skill_name: &str) -> CrossReference {
+        let lower = skill_name.to_lowercase();
+        CrossReference {
+            koi_flagged: self.koi_flagged.contains(&lower),
+            snyk_flagged: self.snyk_flagged.contains(&lower),
+            vt_flagged: self.vt_flagged.contains(&lower),
+        }
+    }
+
+    fn load_file(path: &Path) -> HashSet<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.to_lowercase())
+            .collect()
+    }
+}
+
 impl FlaggedSkill {
-    /// Create a flagged skill record from features and classification
+    /// Create a flagged skill record from features and classification.
+    ///
+    /// If `cross_ref_data` is provided, the cross-reference fields are populated
+    /// from the loaded data files. Otherwise they default to `false`.
     pub fn from_scan(
         skill_name: &str,
         skill_version: &str,
@@ -409,6 +457,7 @@ impl FlaggedSkill {
         classification: &str,
         confidence: f64,
         receipt_id: &str,
+        cross_ref_data: Option<&CrossReferenceData>,
     ) -> Self {
         let mut risk_factors = Vec::new();
 
@@ -469,17 +518,76 @@ impl FlaggedSkill {
             ));
         }
 
+        let cross_reference = cross_ref_data
+            .map(|crd| crd.check(skill_name))
+            .unwrap_or_default();
+
         Self {
             skill_name: skill_name.to_string(),
             skill_version: skill_version.to_string(),
             classification: classification.to_string(),
             confidence,
             primary_risk_factors: risk_factors,
-            cross_reference: CrossReference::default(),
+            cross_reference,
             receipt_id: receipt_id.to_string(),
             verify_url: format!("https://audit.icme.io/receipt/{}", receipt_id),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Safety receipt lookup
+// ---------------------------------------------------------------------------
+
+/// Search `receipts_dir` for the most recent receipt matching the given skill URI.
+///
+/// Iterates all `.json` files in the directory, deserializes them, and returns
+/// the one with the most recent `timestamp` whose `subject.uri` matches.
+pub fn lookup_safety_receipt(
+    skill_uri: &str,
+    receipts_dir: &Path,
+) -> eyre::Result<Option<GuardrailReceipt>> {
+    if !receipts_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let mut best: Option<GuardrailReceipt> = None;
+
+    for entry in std::fs::read_dir(receipts_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let receipt: GuardrailReceipt = match serde_json::from_str(&content) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            if receipt.subject.uri == skill_uri {
+                best = Some(match best {
+                    Some(prev) if receipt.timestamp > prev.timestamp => receipt,
+                    Some(prev) => prev,
+                    None => receipt,
+                });
+            }
+        }
+    }
+
+    Ok(best)
+}
+
+/// Compute a safety score for the spending guardrail.
+///
+/// Formula: `safe + caution * 0.5`
+///
+/// Returns a value in `[0.0, 1.0]` indicating how safe the evaluated skill is.
+/// Higher values indicate safer skills.
+pub fn safety_receipt_score(receipt: &GuardrailReceipt) -> f64 {
+    let scores = &receipt.evaluation.scores;
+    (scores.safe + scores.caution * 0.5).min(1.0)
 }
 
 #[cfg(test)]
@@ -641,10 +749,226 @@ mod tests {
             "MALICIOUS",
             0.92,
             "gr_safety_abc123",
+            None,
         );
 
         assert!(flagged.primary_risk_factors.len() > 5);
         assert!(flagged.primary_risk_factors.iter().any(|f| f.contains("reverse_shell")));
         assert!(flagged.primary_risk_factors.iter().any(|f| f.contains("llm_secret_exposure")));
+    }
+
+    #[test]
+    fn test_cross_reference_check() {
+        let mut koi = HashSet::new();
+        koi.insert("evil-skill".to_string());
+        let mut snyk = HashSet::new();
+        snyk.insert("evil-skill".to_string());
+        snyk.insert("vuln-skill".to_string());
+        let vt = HashSet::new();
+
+        let crd = CrossReferenceData {
+            koi_flagged: koi,
+            snyk_flagged: snyk,
+            vt_flagged: vt,
+        };
+
+        let result = crd.check("Evil-Skill"); // case-insensitive
+        assert!(result.koi_flagged);
+        assert!(result.snyk_flagged);
+        assert!(!result.vt_flagged);
+
+        let result2 = crd.check("vuln-skill");
+        assert!(!result2.koi_flagged);
+        assert!(result2.snyk_flagged);
+    }
+
+    #[test]
+    fn test_cross_reference_empty() {
+        let crd = CrossReferenceData {
+            koi_flagged: HashSet::new(),
+            snyk_flagged: HashSet::new(),
+            vt_flagged: HashSet::new(),
+        };
+
+        let result = crd.check("any-skill");
+        assert!(!result.koi_flagged);
+        assert!(!result.snyk_flagged);
+        assert!(!result.vt_flagged);
+    }
+
+    #[test]
+    fn test_flagged_skill_with_cross_ref() {
+        let mut koi = HashSet::new();
+        koi.insert("bad-skill".to_string());
+        let mut vt = HashSet::new();
+        vt.insert("bad-skill".to_string());
+
+        let crd = CrossReferenceData {
+            koi_flagged: koi,
+            snyk_flagged: HashSet::new(),
+            vt_flagged: vt,
+        };
+
+        let features = SkillFeatures {
+            shell_exec_count: 5,
+            network_call_count: 0,
+            fs_write_count: 0,
+            env_access_count: 0,
+            credential_patterns: 3,
+            external_download: false,
+            obfuscation_score: 0.0,
+            privilege_escalation: false,
+            persistence_mechanisms: 0,
+            data_exfiltration_patterns: 0,
+            skill_md_line_count: 100,
+            script_file_count: 1,
+            dependency_count: 2,
+            author_account_age_days: 10,
+            author_skill_count: 1,
+            stars: 0,
+            downloads: 5,
+            has_virustotal_report: false,
+            vt_malicious_flags: 0,
+            password_protected_archives: false,
+            reverse_shell_patterns: 0,
+            llm_secret_exposure: false,
+        };
+
+        let flagged = FlaggedSkill::from_scan(
+            "bad-skill",
+            "1.0.0",
+            &features,
+            "DANGEROUS",
+            0.8,
+            "gr_safety_test",
+            Some(&crd),
+        );
+
+        assert!(flagged.cross_reference.koi_flagged);
+        assert!(!flagged.cross_reference.snyk_flagged);
+        assert!(flagged.cross_reference.vt_flagged);
+    }
+
+    #[test]
+    fn test_lookup_found() {
+        let tmp = std::env::temp_dir().join("clawguard_test_lookup_found");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let features = SkillFeatures {
+            shell_exec_count: 0, network_call_count: 0, fs_write_count: 0,
+            env_access_count: 0, credential_patterns: 0, external_download: false,
+            obfuscation_score: 0.0, privilege_escalation: false,
+            persistence_mechanisms: 0, data_exfiltration_patterns: 0,
+            skill_md_line_count: 50, script_file_count: 0, dependency_count: 0,
+            author_account_age_days: 100, author_skill_count: 5,
+            stars: 100, downloads: 5000, has_virustotal_report: false,
+            vt_malicious_flags: 0, password_protected_archives: false,
+            reverse_shell_patterns: 0, llm_secret_exposure: false,
+        };
+        let scores = ClassScores { safe: 0.8, caution: 0.15, dangerous: 0.04, malicious: 0.01 };
+        let receipt = GuardrailReceipt::new_safety_receipt(
+            "test-skill", "1.0.0", &features,
+            SafetyClassification::Safe, SafetyDecision::Allow,
+            "No issues", scores, 0.8,
+            "sha256:abc".to_string(), "".to_string(), "sha256:vk".to_string(),
+            None, None, [0u8; 32],
+        );
+
+        let path = tmp.join(format!("{}.json", receipt.receipt_id));
+        std::fs::write(&path, serde_json::to_string_pretty(&receipt).unwrap()).unwrap();
+
+        let found = lookup_safety_receipt("clawhub://test-skill/1.0.0", &tmp).unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().subject.uri, "clawhub://test-skill/1.0.0");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_lookup_not_found() {
+        let tmp = std::env::temp_dir().join("clawguard_test_lookup_not_found");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let found = lookup_safety_receipt("clawhub://nonexistent/1.0.0", &tmp).unwrap();
+        assert!(found.is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_safety_score_safe() {
+        let features = SkillFeatures {
+            shell_exec_count: 0, network_call_count: 0, fs_write_count: 0,
+            env_access_count: 0, credential_patterns: 0, external_download: false,
+            obfuscation_score: 0.0, privilege_escalation: false,
+            persistence_mechanisms: 0, data_exfiltration_patterns: 0,
+            skill_md_line_count: 50, script_file_count: 0, dependency_count: 0,
+            author_account_age_days: 100, author_skill_count: 5,
+            stars: 100, downloads: 5000, has_virustotal_report: false,
+            vt_malicious_flags: 0, password_protected_archives: false,
+            reverse_shell_patterns: 0, llm_secret_exposure: false,
+        };
+        let scores = ClassScores { safe: 0.85, caution: 0.10, dangerous: 0.04, malicious: 0.01 };
+        let receipt = GuardrailReceipt::new_safety_receipt(
+            "safe-skill", "1.0.0", &features,
+            SafetyClassification::Safe, SafetyDecision::Allow,
+            "No issues", scores, 0.85,
+            "sha256:abc".to_string(), "".to_string(), "sha256:vk".to_string(),
+            None, None, [0u8; 32],
+        );
+
+        let score = safety_receipt_score(&receipt);
+        // safe=0.85 + caution*0.5 = 0.85 + 0.05 = 0.90
+        assert!((score - 0.90).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_safety_score_dangerous() {
+        let features = SkillFeatures {
+            shell_exec_count: 5, network_call_count: 10, fs_write_count: 3,
+            env_access_count: 8, credential_patterns: 5, external_download: true,
+            obfuscation_score: 3.0, privilege_escalation: true,
+            persistence_mechanisms: 2, data_exfiltration_patterns: 3,
+            skill_md_line_count: 200, script_file_count: 3, dependency_count: 10,
+            author_account_age_days: 5, author_skill_count: 50,
+            stars: 0, downloads: 10, has_virustotal_report: false,
+            vt_malicious_flags: 0, password_protected_archives: false,
+            reverse_shell_patterns: 0, llm_secret_exposure: true,
+        };
+        let scores = ClassScores { safe: 0.05, caution: 0.10, dangerous: 0.70, malicious: 0.15 };
+        let receipt = GuardrailReceipt::new_safety_receipt(
+            "danger-skill", "1.0.0", &features,
+            SafetyClassification::Dangerous, SafetyDecision::Deny,
+            "Risk detected", scores, 0.70,
+            "sha256:abc".to_string(), "".to_string(), "sha256:vk".to_string(),
+            None, None, [0u8; 32],
+        );
+
+        let score = safety_receipt_score(&receipt);
+        // safe=0.05 + caution*0.5 = 0.05 + 0.05 = 0.10
+        assert!((score - 0.10).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_payment_info_roundtrip() {
+        let payment = PaymentInfo {
+            network: "eip155:8453".to_string(),
+            asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".to_string(),
+            amount: "5000".to_string(),
+            payer: "0xabc123".to_string(),
+            payee: "0xdef456".to_string(),
+            tx_hash: "0x1234567890abcdef".to_string(),
+            scheme: "exact".to_string(),
+        };
+
+        let json = serde_json::to_string(&payment).unwrap();
+        let parsed: PaymentInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.network, "eip155:8453");
+        assert_eq!(parsed.amount, "5000");
+        assert_eq!(parsed.tx_hash, "0x1234567890abcdef");
+        assert_eq!(parsed.scheme, "exact");
     }
 }

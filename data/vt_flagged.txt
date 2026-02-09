@@ -1,0 +1,7 @@
+# VirusTotal flagged skills — one skill name per line
+# Updated: 2026-02-09
+# Source: VirusTotal scan results
+#
+# Add skill names (slugs) flagged by VirusTotal engines.
+# Lines starting with # are comments.
+crypto-analyzer
