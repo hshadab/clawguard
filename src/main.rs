@@ -159,6 +159,10 @@ enum Commands {
         /// Rate limit in requests per minute per IP (0 = no limit)
         #[arg(long, default_value_t = 60)]
         rate_limit: u32,
+
+        /// Path for JSONL access log
+        #[arg(long, default_value = "clawguard-access.jsonl")]
+        access_log: String,
     },
 
     /// Verify a guardrail receipt
@@ -883,7 +887,7 @@ fn compute_scores(feature_vec: &[i32]) -> Result<ClassScores> {
     Ok(ClassScores::from_raw_scores(&raw_scores))
 }
 
-fn cmd_serve(bind: String, max_proofs: usize, require_proof: bool, rate_limit: u32) -> Result<()> {
+fn cmd_serve(bind: String, max_proofs: usize, require_proof: bool, rate_limit: u32, access_log: String) -> Result<()> {
     use clawguard::server::{run_server, ServerConfig};
 
     let bind_addr = bind.parse()
@@ -895,6 +899,7 @@ fn cmd_serve(bind: String, max_proofs: usize, require_proof: bool, rate_limit: u
         require_proof,
         guards_config: load_config(),
         rate_limit_rpm: rate_limit,
+        access_log_path: access_log,
     };
 
     eprintln!("Starting ClawGuard prover service...");
@@ -1380,7 +1385,8 @@ fn main() {
             max_proofs,
             require_proof,
             rate_limit,
-        } => cmd_serve(bind, max_proofs, require_proof, rate_limit),
+            access_log,
+        } => cmd_serve(bind, max_proofs, require_proof, rate_limit, access_log),
         Commands::VerifyReceipt {
             input,
             skill,
